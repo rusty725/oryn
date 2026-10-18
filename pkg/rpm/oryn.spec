@@ -8,7 +8,7 @@
 %global _docdir_fmt %{name}
 
 Name:           oryn
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Terminal hardware monitor with every temperature sensor
 
@@ -57,5 +57,9 @@ install -Dm0644 doc/oryn.1 %{buildroot}%{_mandir}/man1/oryn.1
 %{_mandir}/man1/oryn.1*
 
 %changelog
+* Sat Oct 17 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.1-1
+- Intel GPUs (xe and i915) in the GPU panel.
+- Terminal theme: dim text readable on Solarized and similar palettes.
+
 * Fri Oct 16 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.0-1
 - First release.

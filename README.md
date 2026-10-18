@@ -76,10 +76,10 @@ ready-made packages for x86_64 (64-bit Intel/AMD). On other machines
 
 | Package | For |
 |---------|-----|
-| `oryn-0.1.0-1-x86_64.pkg.tar.zst` | Arch Linux, CachyOS, EndeavourOS, Manjaro |
-| `oryn_0.1.0-1_amd64.deb` | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS |
-| `oryn-0.1.0-1.x86_64.rpm` | Fedora, RHEL / Rocky / Alma 9+, openSUSE |
-| `oryn-0.1.0-x86_64-linux.tar.gz` | any other x86_64 Linux with glibc 2.34+ |
+| `oryn-0.1.1-1-x86_64.pkg.tar.zst` | Arch Linux, CachyOS, EndeavourOS, Manjaro |
+| `oryn_0.1.1-1_amd64.deb` | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS |
+| `oryn-0.1.1-1.x86_64.rpm` | Fedora, RHEL / Rocky / Alma 9+, openSUSE |
+| `oryn-0.1.1-x86_64-linux.tar.gz` | any other x86_64 Linux with glibc 2.34+ |
 
 Each package installs the `oryn` command and its man page (`man oryn`).
 The commands below download the file into the current folder and install
@@ -89,8 +89,8 @@ run `sha256sum -c --ignore-missing SHA256SUMS`.
 ### Arch Linux, CachyOS, Manjaro
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.0/oryn-0.1.0-1-x86_64.pkg.tar.zst
-sudo pacman -U oryn-0.1.0-1-x86_64.pkg.tar.zst
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.1/oryn-0.1.1-1-x86_64.pkg.tar.zst
+sudo pacman -U oryn-0.1.1-1-x86_64.pkg.tar.zst
 sudo pacman -S --needed --asdeps smartmontools hwdata   # optional extras
 ```
 
@@ -106,8 +106,8 @@ makepkg -si
 ### Debian, Ubuntu, Linux Mint, Pop!_OS
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.0/oryn_0.1.0-1_amd64.deb
-sudo apt install ./oryn_0.1.0-1_amd64.deb
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.1/oryn_0.1.1-1_amd64.deb
+sudo apt install ./oryn_0.1.1-1_amd64.deb
 sudo apt install smartmontools          # optional extra
 ```
 
@@ -117,8 +117,8 @@ in its repositories instead of the file.
 ### Fedora, RHEL, Rocky, AlmaLinux
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.0/oryn-0.1.0-1.x86_64.rpm
-sudo dnf install ./oryn-0.1.0-1.x86_64.rpm
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.1/oryn-0.1.1-1.x86_64.rpm
+sudo dnf install ./oryn-0.1.1-1.x86_64.rpm
 ```
 
 `dnf` also installs the recommended `smartmontools` and `hwdata`.
@@ -126,8 +126,8 @@ sudo dnf install ./oryn-0.1.0-1.x86_64.rpm
 ### openSUSE
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.0/oryn-0.1.0-1.x86_64.rpm
-sudo zypper install --allow-unsigned-rpm ./oryn-0.1.0-1.x86_64.rpm
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.1/oryn-0.1.1-1.x86_64.rpm
+sudo zypper install --allow-unsigned-rpm ./oryn-0.1.1-1.x86_64.rpm
 ```
 
 ### Any other Linux: the .tar.gz
@@ -136,9 +136,9 @@ A plain binary plus the man page, for distributions without a package
 above. Needs glibc 2.34 or newer (`ldd --version` shows yours).
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.0/oryn-0.1.0-x86_64-linux.tar.gz
-tar xzf oryn-0.1.0-x86_64-linux.tar.gz
-cd oryn-0.1.0-x86_64-linux
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.1/oryn-0.1.1-x86_64-linux.tar.gz
+tar xzf oryn-0.1.1-x86_64-linux.tar.gz
+cd oryn-0.1.1-x86_64-linux
 sudo install -Dm755 oryn /usr/local/bin/oryn
 sudo install -Dm644 oryn.1 /usr/local/share/man/man1/oryn.1
 ```
