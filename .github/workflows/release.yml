@@ -124,7 +124,7 @@ jobs:
           oryn --version
           oryn --list || true
           apt-get remove -y oryn
-          if command -v oryn; then echo "still installed" >&2; exit 1; fi
+          if [ -e /usr/bin/oryn ]; then echo "still installed" >&2; exit 1; fi
 
   test-rpm:
     needs: build
@@ -145,7 +145,7 @@ jobs:
           oryn --version
           oryn --list || true
           ${{ matrix.remove }}
-          if command -v oryn; then echo "still installed" >&2; exit 1; fi
+          if [ -e /usr/bin/oryn ]; then echo "still installed" >&2; exit 1; fi
 
   test-arch:
     needs: build-arch
@@ -160,7 +160,7 @@ jobs:
           oryn --version
           oryn --list || true
           pacman -R --noconfirm oryn
-          if command -v oryn; then echo "still installed" >&2; exit 1; fi
+          if [ -e /usr/bin/oryn ]; then echo "still installed" >&2; exit 1; fi
 
   test-tarball:
     needs: build
@@ -182,7 +182,7 @@ jobs:
           install -Dm644 oryn.1 /usr/local/share/man/man1/oryn.1
           oryn --version
           rm /usr/local/bin/oryn /usr/local/share/man/man1/oryn.1
-          if command -v oryn; then echo "still installed" >&2; exit 1; fi
+          if [ -e /usr/local/bin/oryn ]; then echo "still installed" >&2; exit 1; fi
 
   release:
     if: github.ref_type == 'tag'

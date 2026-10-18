@@ -97,8 +97,12 @@ impl PowerMeter {
 
     /// Take a new reading. The first RAPL reading only sets the baseline.
     pub fn refresh(&mut self) {
+        self.refresh_at(Instant::now());
+    }
+
+    /// `refresh` as if it were `now`, so tests control the time between reads.
+    fn refresh_at(&mut self, now: Instant) {
         if !self.zones.is_empty() {
-            let now = Instant::now();
             let mut values = Vec::with_capacity(self.zones.len());
             for z in &self.zones {
                 match read_u64(&z.energy) {
@@ -160,6 +164,7 @@ pub fn fmt_watts(w: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn zone(root: &Path, dir: &str, name: &str, uj: u64) {
         let d = root.join("sys/class/powercap").join(dir);
@@ -178,21 +183,20 @@ mod tests {
         zone(&tmp, "intel-rapl:1", "psys", 9); // whole platform: not the CPU
         let mut p = PowerMeter::cpu(&tmp);
         assert_eq!(p.zones.len(), 1, "only package-0");
-        p.refresh();
+        let t0 = Instant::now();
+        p.refresh_at(t0);
         assert_eq!(p.watts, None, "first read is only the baseline");
         // 0.5 s later, 30 J more: 60 W.
-        p.last.as_mut().unwrap().1 -= std::time::Duration::from_millis(500);
         fs::write(tmp.join("sys/class/powercap/intel-rapl:0/energy_uj"), "31000000\n").unwrap();
-        p.refresh();
+        p.refresh_at(t0 + Duration::from_millis(500));
         let w = p.watts.unwrap();
-        assert!((w - 60.0).abs() < 1.0, "{w}");
-        // The counter wraps around.
+        assert!((w - 60.0).abs() < 0.01, "{w}");
+        // The counter wraps around: 10 J to the top, then 35 J, in 1 s.
         p.last.as_mut().unwrap().0[0] = 262_143_328_850 - 10_000_000;
-        p.last.as_mut().unwrap().1 -= std::time::Duration::from_millis(1000);
         fs::write(tmp.join("sys/class/powercap/intel-rapl:0/energy_uj"), "35000000\n").unwrap();
-        p.refresh();
+        p.refresh_at(t0 + Duration::from_millis(1500));
         let w = p.watts.unwrap();
-        assert!((w - 45.0).abs() < 1.0, "{w}");
+        assert!((w - 45.0).abs() < 0.01, "{w}");
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -224,14 +228,14 @@ mod tests {
         let mut d = PowerMeter::dram(&tmp);
         assert_eq!(d.zones.len(), 2);
         assert_eq!(PowerMeter::cpu(&tmp).zones.len(), 1, "dram isn't counted as CPU");
-        d.refresh();
+        let t0 = Instant::now();
+        d.refresh_at(t0);
         // 1 s later, 3 J + 5 J more: 8 W for both together.
-        d.last.as_mut().unwrap().1 -= std::time::Duration::from_secs(1);
         fs::write(tmp.join("sys/class/powercap/intel-rapl:0:2/energy_uj"), "4000000\n").unwrap();
         fs::write(tmp.join("sys/class/powercap/intel-rapl:1/energy_uj"), "7000000\n").unwrap();
-        d.refresh();
+        d.refresh_at(t0 + Duration::from_secs(1));
         let w = d.watts.unwrap();
-        assert!((w - 8.0).abs() < 0.2, "{w}");
+        assert!((w - 8.0).abs() < 0.01, "{w}");
         let none = PowerMeter::dram(&tmp.join("nothing"));
         assert!(none.zones.is_empty());
         let _ = fs::remove_dir_all(&tmp);
