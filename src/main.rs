@@ -7,6 +7,7 @@
 //! |------------|-----------------------------------------------------|
 //! | ↑/↓, k/j   | select sensor                                       |
 //! | Tab        | process list keys: f filter, e exec, t/k stop, n nice |
+//! | PgUp/PgDn  | scroll the panels when the window is too short      |
 //! | u          | toggle °C / °F                                      |
 //! | + / -      | faster / slower refresh                             |
 //! | s          | cycle sort (name / temp)                            |
@@ -413,9 +414,12 @@ struct App {
     pv: panels::ProcView,
     /// Tab: arrow and action keys go to the process list instead of sensors.
     focus_proc: bool,
-    /// Panels that are switched on but left out of the last frame because the
-    /// terminal is too small for them.
-    squeezed: std::cell::RefCell<Vec<usize>>,
+    /// Panels that are switched on but scrolled out of the last frame because
+    /// the terminal is too short for all of them.
+    offscreen: std::cell::RefCell<Offscreen>,
+    /// How many panels the overflowing columns are scrolled down (PgUp/PgDn,
+    /// or the wheel outside the sensor table and process list).
+    scroll: usize,
     /// Where the sensor table and process list were last drawn (mouse hits).
     table_rect: Rect,
     proc_rect: Rect,
@@ -450,7 +454,8 @@ impl App {
             battery: None,
             pv: Default::default(),
             focus_proc: false,
-            squeezed: Default::default(),
+            offscreen: Default::default(),
+            scroll: 0,
             table_rect: Rect::default(),
             proc_rect: Rect::default(),
             flash: None,
@@ -620,8 +625,9 @@ impl App {
         match key.code {
             KeyCode::Down => self.proc_move(1),
             KeyCode::Up => self.proc_move(-1),
-            KeyCode::PageDown => self.proc_move(page),
-            KeyCode::PageUp => self.proc_move(-page),
+            // While the list itself is scrolled out of view, PgUp/PgDn scroll the panels.
+            KeyCode::PageDown if !self.proc_rect.is_empty() => self.proc_move(page),
+            KeyCode::PageUp if !self.proc_rect.is_empty() => self.proc_move(-page),
             KeyCode::Home => self.proc_move(isize::MIN / 2),
             KeyCode::End => self.proc_move(isize::MAX / 2),
             KeyCode::Char('f') | KeyCode::Char('/') => self.pv.prompt = Some(Prompt::Filter),
@@ -744,6 +750,8 @@ impl App {
                 } else if in_table {
                     self.focus_proc = false;
                     self.move_sel(d);
+                } else {
+                    self.scroll_by(d);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -770,6 +778,13 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Scroll the panels by `delta` whole panels, within what the last frame
+    /// had left over.
+    fn scroll_by(&mut self, delta: isize) {
+        let max = self.offscreen.borrow().max_scroll;
+        self.scroll = self.scroll.min(max).saturating_add_signed(delta).min(max);
     }
 
     /// Only gather data for panels that are on screen.
@@ -1296,6 +1311,8 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Down | KeyCode::Char('j') => app.move_sel(1),
                     KeyCode::Up | KeyCode::Char('k') => app.move_sel(-1),
+                    KeyCode::PageDown => app.scroll_by(1),
+                    KeyCode::PageUp => app.scroll_by(-1),
                     KeyCode::Char('t') => app.open_picker(),
                     KeyCode::Char('c') | KeyCode::Char('C') => {
                         app.compact = !app.compact;
@@ -1592,16 +1609,17 @@ fn layout(app: &App, body: Rect) -> Vec<(Slot, Rect)> {
         }
     }
     if columns.is_empty() {
-        // One column: sensors, system panels, then the chart and process
-        // list (the two that use extra height best).
+        // One column: sensors, system panels, the static specs, then the
+        // chart and process list (the two that use extra height best). On a
+        // short terminal the column scrolls, so the live panels come first.
         let mut all = Vec::new();
         if show[P_SENSORS] {
             all.push(Slot::Panel(P_SENSORS));
         }
+        all.extend(sys_slots.iter().copied().filter(|s| *s != Slot::Panel(P_PROC)));
         if show[P_SPECS] {
             all.push(Slot::Panel(P_SPECS));
         }
-        all.extend(sys_slots.iter().copied().filter(|s| *s != Slot::Panel(P_PROC)));
         if show[P_HISTORY] {
             all.push(Slot::Panel(P_HISTORY));
         }
@@ -1614,7 +1632,7 @@ fn layout(app: &App, body: Rect) -> Vec<(Slot, Rect)> {
 
     let mut out = Vec::new();
     for (area, mut slots) in columns {
-        drop_what_doesnt_fit(app, &mut slots, area);
+        scroll_window(app, &mut slots, area);
         let n = slots.len();
         let mut items: Vec<(Slot, Constraint)> = Vec::new();
         for (idx, slot) in slots.iter().enumerate() {
@@ -1627,7 +1645,7 @@ fn layout(app: &App, body: Rect) -> Vec<(Slot, Rect)> {
                     } else {
                         // Every sensor if possible, leaving the other panels
                         // the height they need (they all fit: see
-                        // drop_what_doesnt_fit) — and never more than two
+                        // scroll_window) — and never more than two
                         // thirds of the column.
                         let others: u16 = slots.iter().filter(|s| **s != *slot).map(|s| min_height(app, *s, area)).sum();
                         let cap = area.height.saturating_sub(others).min(area.height * 2 / 3);
@@ -1716,55 +1734,49 @@ fn min_height(app: &App, slot: Slot, area: Rect) -> u16 {
     }
 }
 
-/// When a column is too short for all its panels, leave out the least
-/// important ones (static specs first, the sensor table never) instead of
-/// squashing every panel until none of them shows anything. The footer says
-/// how many were left out.
-fn drop_what_doesnt_fit(app: &App, slots: &mut Vec<Slot>, area: Rect) {
-    let rank = |s: &Slot| match s {
-        Slot::Panel(P_SPECS) => 7,
-        Slot::Panel(P_PROC) => 6,
-        Slot::Panel(P_NET) => 5,
-        Slot::MemDisks | Slot::Panel(P_MEM) | Slot::Panel(P_DISKS) => 4,
-        Slot::Panel(P_HISTORY) => 3,
-        Slot::Panel(P_GPU) => 2,
-        Slot::Panel(P_CPU) => 1,
-        _ => 0,
-    };
+/// Panels left out of the last frame, above and below what's shown.
+#[derive(Default)]
+struct Offscreen {
+    above: Vec<usize>,
+    below: Vec<usize>,
+    /// The furthest `App::scroll` can usefully go (the tallest column's).
+    max_scroll: usize,
+}
+
+/// When a column is too short for all its panels, show a run of them that
+/// fits, starting `app.scroll` panels down, instead of squashing every panel
+/// until none of them shows anything. The footer says what's above and below.
+fn scroll_window(app: &App, slots: &mut Vec<Slot>, area: Rect) {
     let need = |v: &[Slot]| v.iter().map(|s| min_height(app, *s, area)).sum::<u16>();
     if slots.len() <= 1 || need(slots) <= area.height {
         return;
     }
-    // Keep panels in order of importance while they fit; one that's too
-    // tall is skipped, so smaller ones can still use the room left.
-    let mut by_rank: Vec<usize> = (0..slots.len()).collect();
-    by_rank.sort_by_key(|&i| (rank(&slots[i]), i));
-    let mut keep = vec![false; slots.len()];
-    let mut used = 0u16;
-    for i in by_rank {
-        let h = min_height(app, slots[i], area);
-        if rank(&slots[i]) == 0 || used + h <= area.height {
-            keep[i] = true;
-            used = used.saturating_add(h);
-        }
+    // Scrolled all the way down, the last panels fill the column.
+    let max = (0..slots.len()).find(|&i| need(&slots[i..]) <= area.height).unwrap_or(slots.len() - 1);
+    let first = app.scroll.min(max);
+    // At least one panel, even one taller than the column.
+    let mut end = first + 1;
+    while end < slots.len() && need(&slots[first..=end]) <= area.height {
+        end += 1;
     }
-    let mut kept = Vec::new();
-    for (i, slot) in slots.drain(..).enumerate() {
-        if keep[i] {
-            kept.push(slot);
-        } else {
-            let panels: &[usize] = match slot {
-                Slot::MemDisks => &[P_MEM, P_DISKS],
-                Slot::Panel(p) => &[p][..],
-            };
-            app.squeezed.borrow_mut().extend_from_slice(panels);
-        }
-    }
-    *slots = kept;
+    let panels = |v: &[Slot]| -> Vec<usize> {
+        v.iter()
+            .flat_map(|s| match *s {
+                Slot::MemDisks => vec![P_MEM, P_DISKS],
+                Slot::Panel(p) => vec![p],
+            })
+            .collect()
+    };
+    let mut off = app.offscreen.borrow_mut();
+    off.above.extend(panels(&slots[..first]));
+    off.below.extend(panels(&slots[end..]));
+    off.max_scroll = off.max_scroll.max(max);
+    slots.truncate(end);
+    slots.drain(..first);
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
-    app.squeezed.borrow_mut().clear();
+    *app.offscreen.borrow_mut() = Offscreen::default();
     let th = app.th();
     // Paint the whole screen in the theme's background/foreground first.
     f.render_widget(Block::new().style(Style::new().bg(th.bg).fg(th.fg)), f.area());
@@ -1899,19 +1911,23 @@ fn draw_footer(f: &mut Frame, app: &App, footer: Rect, th: &Theme) {
     };
     // The essential keys first (view, quit, panels, compact)…
     take(&mut keep, &mut budget, 1);
-    // …then a note on panels left out for lack of room, so they don't seem
-    // lost…
-    let squeezed = app.squeezed.borrow();
-    let names = squeezed.iter().map(|&p| PANELS[p].0).collect::<Vec<_>>().join(", ");
-    let note = [
-        format!("{} hidden: {names} (window too small)  ", squeezed.len()),
-        format!("+{} panels hidden (window too small)  ", squeezed.len()),
-        format!("+{} hidden  ", squeezed.len()),
-    ]
-    .into_iter()
-    .find(|n| squeezed.is_empty() || n.chars().count() <= budget)
-    .filter(|_| !squeezed.is_empty())
-    .unwrap_or_default();
+    // …then a note on panels scrolled out of view, so they don't seem lost…
+    let off = app.offscreen.borrow();
+    let names = |arrow: &str, v: &[usize]| {
+        (!v.is_empty()).then(|| format!("{arrow} {}", v.iter().map(|&p| PANELS[p].0).collect::<Vec<_>>().join(", ")))
+    };
+    let counts = |arrow: &str, v: &[usize]| (!v.is_empty()).then(|| format!("{arrow}{}", v.len()));
+    let join = |a: Option<String>, b: Option<String>| a.into_iter().chain(b).collect::<Vec<_>>().join(" · ");
+    let note = if off.above.is_empty() && off.below.is_empty() {
+        String::new()
+    } else {
+        let full = join(names("↑", &off.above), names("↓", &off.below));
+        let short = join(counts("↑", &off.above), counts("↓", &off.below));
+        [format!("{full} (PgUp/PgDn, wheel)  "), format!("{short} panels (PgUp/PgDn)  "), format!("{short}  ")]
+            .into_iter()
+            .find(|n| n.chars().count() <= budget)
+            .unwrap_or_default()
+    };
     budget -= note.chars().count();
     // …then whatever other hints still fit.
     take(&mut keep, &mut budget, u8::MAX);
@@ -2683,6 +2699,38 @@ mod render_fuzz {
             }
         }
     }
+    #[test]
+    fn short_window_scrolls_through_every_panel() {
+        // A 1366×768 laptop: about 134×30 cells, one column.
+        let mut a = app();
+        let mut seen = [false; NP];
+        let mut footer = String::new();
+        for _ in 0..NP {
+            let mut t = Terminal::new(TestBackend::new(134, 30)).unwrap();
+            t.draw(|f| draw(f, &mut a)).unwrap();
+            let buf = t.backend().buffer();
+            footer = (0..134).map(|x| buf[(x, 29)].symbol()).collect();
+            let off = a.offscreen.borrow();
+            for (p, s) in seen.iter_mut().enumerate() {
+                *s |= !off.above.contains(&p) && !off.below.contains(&p);
+            }
+            if a.scroll == 0 {
+                assert!(off.above.is_empty() && !off.below.is_empty(), "nothing left out at the top");
+                assert!(footer.contains("↓ "), "{footer}");
+            }
+            drop(off);
+            a.scroll_by(1);
+        }
+        assert!(seen.iter().all(|s| *s), "never on screen: {seen:?}");
+        // Scrolled to the bottom: nothing more below, and it stops there.
+        assert!(a.offscreen.borrow().below.is_empty() && footer.contains("↑ "), "{footer}");
+        let max = a.offscreen.borrow().max_scroll;
+        a.scroll_by(5);
+        assert_eq!(a.scroll, max);
+        a.scroll_by(-100);
+        assert_eq!(a.scroll, 0);
+    }
+
     #[test]
     fn panel_menu_spells_out_the_move_keys() {
         let mut a = app();

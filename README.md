@@ -78,10 +78,10 @@ ready-made packages for x86_64 (64-bit Intel/AMD). On other machines
 
 | Package | For |
 |---------|-----|
-| `oryn-0.1.6-1-x86_64.pkg.tar.zst` | Arch Linux, CachyOS, EndeavourOS, Manjaro |
-| `oryn_0.1.6-1_amd64.deb` | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS |
-| `oryn-0.1.6-1.x86_64.rpm` | Fedora, RHEL / Rocky / Alma 9+, openSUSE |
-| `oryn-0.1.6-x86_64-linux.tar.gz` | any other x86_64 Linux with glibc 2.34+ |
+| `oryn-0.1.7-1-x86_64.pkg.tar.zst` | Arch Linux, CachyOS, EndeavourOS, Manjaro |
+| `oryn_0.1.7-1_amd64.deb` | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS |
+| `oryn-0.1.7-1.x86_64.rpm` | Fedora, RHEL / Rocky / Alma 9+, openSUSE |
+| `oryn-0.1.7-x86_64-linux.tar.gz` | any other x86_64 Linux with glibc 2.34+ |
 
 Each package installs the `oryn` command and its man page (`man oryn`).
 The commands below download the file into the current folder and install
@@ -91,8 +91,8 @@ run `sha256sum -c --ignore-missing SHA256SUMS`.
 ### Arch Linux, CachyOS, Manjaro
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.6/oryn-0.1.6-1-x86_64.pkg.tar.zst
-sudo pacman -U oryn-0.1.6-1-x86_64.pkg.tar.zst
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.7/oryn-0.1.7-1-x86_64.pkg.tar.zst
+sudo pacman -U oryn-0.1.7-1-x86_64.pkg.tar.zst
 sudo pacman -S --needed --asdeps smartmontools hwdata   # optional extras
 ```
 
@@ -108,8 +108,8 @@ makepkg -si
 ### Debian, Ubuntu, Linux Mint, Pop!_OS
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.6/oryn_0.1.6-1_amd64.deb
-sudo apt install ./oryn_0.1.6-1_amd64.deb
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.7/oryn_0.1.7-1_amd64.deb
+sudo apt install ./oryn_0.1.7-1_amd64.deb
 sudo apt install smartmontools          # optional extra
 ```
 
@@ -119,8 +119,8 @@ in its repositories instead of the file.
 ### Fedora, RHEL, Rocky, AlmaLinux
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.6/oryn-0.1.6-1.x86_64.rpm
-sudo dnf install ./oryn-0.1.6-1.x86_64.rpm
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.7/oryn-0.1.7-1.x86_64.rpm
+sudo dnf install ./oryn-0.1.7-1.x86_64.rpm
 ```
 
 `dnf` also installs the recommended `smartmontools` and `hwdata`.
@@ -128,8 +128,8 @@ sudo dnf install ./oryn-0.1.6-1.x86_64.rpm
 ### openSUSE
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.6/oryn-0.1.6-1.x86_64.rpm
-sudo zypper install --allow-unsigned-rpm ./oryn-0.1.6-1.x86_64.rpm
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.7/oryn-0.1.7-1.x86_64.rpm
+sudo zypper install --allow-unsigned-rpm ./oryn-0.1.7-1.x86_64.rpm
 ```
 
 ### Any other Linux: the .tar.gz
@@ -138,9 +138,9 @@ A plain binary plus the man page, for distributions without a package
 above. Needs glibc 2.34 or newer (`ldd --version` shows yours).
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.6/oryn-0.1.6-x86_64-linux.tar.gz
-tar xzf oryn-0.1.6-x86_64-linux.tar.gz
-cd oryn-0.1.6-x86_64-linux
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.7/oryn-0.1.7-x86_64-linux.tar.gz
+tar xzf oryn-0.1.7-x86_64-linux.tar.gz
+cd oryn-0.1.7-x86_64-linux
 sudo install -Dm755 oryn /usr/local/bin/oryn
 sudo install -Dm644 oryn.1 /usr/local/share/man/man1/oryn.1
 ```
@@ -244,6 +244,7 @@ reference.
 |------------|-----------------------------|
 | ↑/↓, k/j   | select sensor for the chart |
 | Tab        | move the keys between the sensor table and the process list |
+| PgUp/PgDn  | scroll the panels when the window is too short for all of them |
 | t          | color scheme picker (live preview; Enter keeps, Esc cancels) |
 | T          | cycle to the next color scheme |
 | u          | toggle °C / °F              |
@@ -254,7 +255,8 @@ reference.
 | q, Esc     | quit                        |
 
 The mouse works too: the wheel scrolls and a click selects, in both the sensor
-table and the process list. Hold Shift to select text with the mouse.
+table and the process list; elsewhere it scrolls the panels. Hold Shift to
+select text with the mouse.
 
 Colors: green < warn ≤ yellow < crit ≤ red. Warn is 80% of the sensor's
 reported critical temp (or 70 °C if it reports none); crit is the reported
@@ -393,12 +395,13 @@ Deepin, Enlightenment and LXDE show without one). Under `sudo` or over SSH,
 where the desktop variables aren't set, it's found from the desktop's
 running process instead.
 
-When the window is too short for every panel that's switched on, Oryn leaves
-out the least important ones rather than squeezing them all until none is
-readable: specs first, then processes, network, memory/disks, history, GPU and
-CPU; the sensor table always stays. The bottom bar says which are hidden
-(`3 hidden: specs, net, proc (window too small)`), and they come back as soon
-as there's room.
+When the window is too short for every panel that's switched on (a laptop
+screen, say), Oryn doesn't squeeze them all until none is readable: it shows
+as many whole panels as fit and lets you scroll through the rest, a panel at
+a time, with **PgUp**/**PgDn** or the mouse wheel. The bottom bar says what's
+above and below (`↑ sensors · ↓ net, specs, history, proc (PgUp/PgDn, wheel)`).
+While the process list has the keys and is on screen, PgUp/PgDn page through
+it instead, so use the wheel (or **Tab** back) to scroll the panels.
 
 ## Categories
 
