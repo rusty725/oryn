@@ -8,7 +8,7 @@
 %global _docdir_fmt %{name}
 
 Name:           oryn
-Version:        0.1.2
+Version:        0.1.3
 Release:        1%{?dist}
 Summary:        Terminal hardware monitor with every temperature sensor
 
@@ -57,6 +57,11 @@ install -Dm0644 doc/oryn.1 %{buildroot}%{_mandir}/man1/oryn.1
 %{_mandir}/man1/oryn.1*
 
 %changelog
+* Sat Oct 17 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.3-1
+- Battery badge in the header on laptops, tablets and handhelds.
+- Integrated GPUs get their own iGPU badge in the header.
+- Specs: network adapter model and driver, GPU VBIOS and disk firmware versions.
+
 * Sat Oct 17 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.2-1
 - Integrated Intel GPUs show the shared chip temperature, labelled (iGPU).
 - GPU clock reads "idle" instead of 0 MHz while the GPU sleeps.
