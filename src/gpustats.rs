@@ -37,6 +37,9 @@ pub struct GpuView {
     pub fan_pct: Option<f32>,
     pub core_mhz: Option<f32>,
     pub mem_mhz: Option<f32>,
+    /// Video BIOS version, where the driver publishes it in sysfs (AMD).
+    /// NVIDIA's comes from nvidia-smi when the specs panel is filled in.
+    pub vbios: Option<String>,
     pub hist: VecDeque<f32>,
 }
 
@@ -87,6 +90,7 @@ impl GpuStats {
                         fan_pct: g.fan_pct,
                         core_mhz: g.core_mhz,
                         mem_mhz: g.mem_mhz,
+                        vbios: None,
                         hist: VecDeque::new(),
                     },
                 ));
@@ -179,6 +183,7 @@ mod amd {
         name: String,
         dev: PathBuf,
         hwmon: Option<PathBuf>,
+        vbios: Option<String>,
     }
 
     fn read(p: &Path) -> Option<f64> {
@@ -214,7 +219,8 @@ mod amd {
                     .as_ref()
                     .map(|h| crate::devnames::Namer::new(root).hwmon("amdgpu", h).0)
                     .unwrap_or_else(|| "AMD GPU".into());
-                Some(Card { id: name, name: display, dev, hwmon })
+                let vbios = fs::read_to_string(dev.join("vbios_version")).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+                Some(Card { id: name, name: display, dev, hwmon, vbios })
             })
             .collect();
         cards.sort_by(|a, b| a.id.cmp(&b.id));
@@ -256,6 +262,7 @@ mod amd {
                 fan_pct: fan,
                 core_mhz: h("freq1_input").map(|hz| (hz / 1e6) as f32),
                 mem_mhz: h("freq2_input").map(|hz| (hz / 1e6) as f32),
+                vbios: self.vbios.clone(),
                 hist: Default::default(),
             }
         }

@@ -18,6 +18,15 @@ pub struct Specs {
     pub lines: Vec<Line>,
 }
 
+/// A GPU as the GPU panel knows it.
+pub struct GpuSpec {
+    pub name: String,
+    pub vram: Option<f64>,
+    pub nvidia: bool,
+    /// Video BIOS version, when the driver reports it in sysfs (AMD).
+    pub vbios: Option<String>,
+}
+
 fn root() -> PathBuf {
     PathBuf::from(crate::env_os("SYSFS").unwrap_or_else(|| "/".into()))
 }
@@ -33,9 +42,9 @@ fn human_size(bytes: f64) -> String {
 }
 
 impl Specs {
-    /// `gpus`: (name, VRAM bytes) from the GPU panel; `dimms`: RAM stick names
-    /// from the sensors; `cpu_name` from sysinfo.
-    pub fn collect(cpu_name: &str, threads: usize, mem_total: u64, gpus: &[(String, Option<f64>)], dimms: &[String]) -> Self {
+    /// `gpus` from the GPU panel; `dimms`: RAM stick names from the sensors;
+    /// `cpu_name` from sysinfo.
+    pub fn collect(cpu_name: &str, threads: usize, mem_total: u64, gpus: &[GpuSpec], dimms: &[String]) -> Self {
         use sysinfo::System;
         let r = root();
         let mut lines = Vec::new();
@@ -83,17 +92,23 @@ impl Specs {
         }
         add("CPU", "CPU", cpu);
 
-        // GPU(s).
-        let driver = nvidia_driver();
-        for (name, vram) in gpus {
-            let mut v = name.clone();
-            if let Some(b) = vram {
+        // GPU(s). nvidia-smi lists NVIDIA cards in the same order as the panel.
+        let nv = if gpus.iter().any(|g| g.nvidia) { nvidia_info() } else { Vec::new() };
+        let mut nv_iter = nv.iter();
+        for g in gpus {
+            let mut v = g.name.clone();
+            if let Some(b) = g.vram {
                 v.push_str(&format!(" · {:.0} GB VRAM", b / 1024f64.powi(3)));
             }
-            if name.contains("NVIDIA")
-                && let Some(d) = &driver {
-                    v.push_str(&format!(" · driver {d}"));
+            let mut vbios = g.vbios.clone();
+            if g.nvidia
+                && let Some((driver, nv_vbios)) = nv_iter.next() {
+                    v.push_str(&format!(" · driver {driver}"));
+                    vbios = vbios.or_else(|| nv_vbios.clone());
                 }
+            if let Some(b) = vbios {
+                v.push_str(&format!(" · VBIOS {b}"));
+            }
             add("GPU", "GPU", v);
         }
 
@@ -123,7 +138,7 @@ impl Specs {
         add("RAM", "RAM", ram);
 
         // Drives: model, size, type.
-        let mut drives: Vec<(String, f64, &'static str)> = fs::read_dir(r.join("sys/block"))
+        let mut drives: Vec<(String, f64, &'static str, Option<String>)> = fs::read_dir(r.join("sys/block"))
             .into_iter()
             .flatten()
             .flatten()
@@ -150,38 +165,19 @@ impl Specs {
                 } else {
                     "SSD"
                 };
-                Some((model, sectors * 512.0, kind))
+                // NVMe: the controller's full firmware revision. SATA/SCSI:
+                // `rev`, which the kernel cuts to its last 4 characters.
+                let firmware = read(&dir.join("device/firmware_rev")).or_else(|| read(&dir.join("device/rev")));
+                Some((model, sectors * 512.0, kind, firmware))
             })
             .collect();
         drives.sort_by(|a, b| a.2.cmp(b.2).then(a.0.cmp(&b.0)));
-        for (model, bytes, kind) in drives {
-            add("Disk", kind, format!("{model} · {} {}", human_size(bytes), kind_word(kind)));
+        for (model, bytes, kind, firmware) in drives {
+            let fw = firmware.map(|f| format!(" · firmware {f}")).unwrap_or_default();
+            add("Disk", kind, format!("{model} · {} {}{fw}", human_size(bytes), kind_word(kind)));
         }
 
-        // Network adapters that are up, with IPv4 and link speed.
-        let mut nets: Vec<String> = fs::read_dir(r.join("sys/class/net"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().into_string().ok()?;
-                if name == "lo" || !e.path().join("device").exists() {
-                    return None; // virtual interfaces (docker, veth, bridges)
-                }
-                let speed = read(&e.path().join("speed")).and_then(|s| s.parse::<i64>().ok()).filter(|s| *s > 0);
-                let state = read(&e.path().join("operstate")).unwrap_or_default();
-                let mut v = name.clone();
-                if let Some(s) = speed {
-                    v.push_str(&if s >= 1000 { format!(" · {} Gb/s", s as f64 / 1000.0) } else { format!(" · {s} Mb/s") });
-                }
-                if state != "up" {
-                    v.push_str(&format!(" · {state}"));
-                }
-                Some(v)
-            })
-            .collect();
-        nets.sort();
-        for n in nets {
+        for n in nets(&r) {
             add("Net", "NET", n);
         }
 
@@ -193,6 +189,67 @@ impl Specs {
 
         Specs { lines }
     }
+}
+
+/// Network adapters (not virtual ones), sorted: "enp8s0 · Realtek RTL8126
+/// 5GbE Controller · r8169 driver · 5 Gb/s", plus the state when not up.
+fn nets(root: &Path) -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    let mut namer = crate::devnames::Namer::new(root);
+    let mut nets: Vec<String> = fs::read_dir(root.join("sys/class/net"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            if name == "lo" || !e.path().join("device").exists() {
+                return None; // virtual interfaces (docker, veth, bridges)
+            }
+            let speed = read(&e.path().join("speed")).and_then(|s| s.parse::<i64>().ok()).filter(|s| *s > 0);
+            let state = read(&e.path().join("operstate")).unwrap_or_default();
+            let mut v = name.clone();
+            let dev = e.path().join("device");
+            let driver = fs::read_link(dev.join("driver")).ok().and_then(|p| Some(p.file_name()?.to_string_lossy().to_string()));
+            #[cfg(target_os = "linux")]
+            if let Some(model) = nic_model(&mut namer, &dev, driver.as_deref()) {
+                v.push_str(&format!(" · {model}"));
+            }
+            if let Some(d) = &driver {
+                v.push_str(&format!(" · {d} driver"));
+            }
+            if let Some(s) = speed {
+                v.push_str(&if s >= 1000 { format!(" · {} Gb/s", s as f64 / 1000.0) } else { format!(" · {s} Mb/s") });
+            }
+            if state != "up" {
+                v.push_str(&format!(" · {state}"));
+            }
+            Some(v)
+        })
+        .collect();
+    nets.sort();
+    nets
+}
+
+/// The network adapter at `dev` (the interface's `device` link): the USB
+/// product for USB adapters, else the PCI name from `pci.ids`.
+#[cfg(target_os = "linux")]
+fn nic_model(namer: &mut crate::devnames::Namer, dev: &Path, driver: Option<&str>) -> Option<String> {
+    let subsystem = fs::read_link(dev.join("subsystem")).ok()?;
+    if subsystem.file_name()? == "usb" {
+        // `dev` is the USB interface; the device above it has the names.
+        let usb = fs::canonicalize(dev).ok()?.parent()?.to_path_buf();
+        let product = read(&usb.join("product"))?;
+        return Some(match read(&usb.join("manufacturer")) {
+            Some(m) if !product.to_ascii_lowercase().starts_with(&m.to_ascii_lowercase()) => format!("{m} {product}"),
+            _ => product,
+        });
+    }
+    let name = namer.pci_name(dev)?;
+    // Without pci.ids the name ends in "(driver)", which is shown separately.
+    Some(match driver {
+        Some(d) => name.strip_suffix(&format!(" ({d})")).unwrap_or(&name).to_string(),
+        None => name,
+    })
 }
 
 fn kind_word(kind: &str) -> &'static str {
@@ -382,14 +439,28 @@ fn parse_version(text: &str) -> Option<String> {
 }
 
 /// NVIDIA driver version, if nvidia-smi is installed.
-fn nvidia_driver() -> Option<String> {
+/// (driver version, VBIOS version) per NVIDIA GPU, in nvidia-smi's order.
+fn nvidia_info() -> Vec<(String, Option<String>)> {
     let exe = crate::env_str("NVIDIA_SMI").unwrap_or_else(|| "nvidia-smi".into());
-    let out = std::process::Command::new(exe)
-        .args(["--query-gpu=driver_version", "--format=csv,noheader"])
+    let Ok(out) = std::process::Command::new(exe)
+        .args(["--query-gpu=driver_version,vbios_version", "--format=csv,noheader"])
         .stderr(std::process::Stdio::null())
         .output()
-        .ok()?;
-    String::from_utf8(out.stdout).ok()?.lines().next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && !s.contains(' '))
+    else {
+        return Vec::new();
+    };
+    parse_nvidia_info(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_nvidia_info(text: &str) -> Vec<(String, Option<String>)> {
+    // A field nvidia-smi can't read is "[N/A]" or similar: anything with a space or bracket.
+    let ok = |s: &str| (!s.is_empty() && !s.contains([' ', '['])).then(|| s.to_string());
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.split(',').map(str::trim);
+            Some((ok(f.next()?)?, f.next().and_then(ok)))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -437,6 +508,78 @@ mod tests {
         let env = process_env(&tmp, pid);
         assert!(env.contains(&("XDG_SESSION_TYPE".into(), "wayland".into())));
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_adapter_model_and_driver() {
+        use std::os::unix::fs::symlink;
+        let tmp = std::env::temp_dir().join(format!("oryn-nets-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let mk = |p: &Path, files: &[(&str, &str)]| {
+            fs::create_dir_all(p).unwrap();
+            for (f, v) in files {
+                fs::write(p.join(f), format!("{v}\n")).unwrap();
+            }
+        };
+        let bus = |b: &str, drv: &str| {
+            let d = tmp.join(format!("sys/bus/{b}/drivers/{drv}"));
+            fs::create_dir_all(&d).unwrap();
+            (tmp.join(format!("sys/bus/{b}")), d)
+        };
+        let iface = |name: &str, dev: &Path, files: &[(&str, &str)]| {
+            let n = tmp.join("sys/class/net").join(name);
+            mk(&n, files);
+            symlink(dev, n.join("device")).unwrap();
+        };
+        mk(&tmp.join("usr/share/hwdata"), &[("pci.ids", "10ec  Realtek Semiconductor Co., Ltd.\n\t8126  RTL8126 5GbE Controller")]);
+
+        // PCI Ethernet, named from pci.ids.
+        let eth = tmp.join("sys/devices/pci0000:00/0000:08:00.0");
+        mk(&eth, &[("vendor", "0x10ec"), ("device", "0x8126"), ("class", "0x020000")]);
+        let (pci, r8169) = bus("pci", "r8169");
+        symlink(&pci, eth.join("subsystem")).unwrap();
+        symlink(&r8169, eth.join("driver")).unwrap();
+        iface("enp8s0", &eth, &[("speed", "5000"), ("operstate", "up")]);
+
+        // Wi-Fi card that pci.ids doesn't list: no "(iwlwifi)" twice.
+        let wifi = tmp.join("sys/devices/pci0000:00/0000:00:14.3");
+        mk(&wifi, &[("vendor", "0x8086"), ("device", "0x51f1"), ("class", "0x028000")]);
+        let (_, iwl) = bus("pci", "iwlwifi");
+        symlink(&pci, wifi.join("subsystem")).unwrap();
+        symlink(&iwl, wifi.join("driver")).unwrap();
+        iface("wlan0", &wifi, &[("speed", "-1"), ("operstate", "up")]);
+
+        // USB adapter: the interface's parent has the names.
+        let usbdev = tmp.join("sys/devices/pci0000:00/0000:00:14.0/usb1/1-2");
+        mk(&usbdev, &[("manufacturer", "Realtek"), ("product", "USB 10/100/1000 LAN")]);
+        let intf = usbdev.join("1-2:1.0");
+        mk(&intf, &[]);
+        let (usb, r8152) = bus("usb", "r8152");
+        symlink(&usb, intf.join("subsystem")).unwrap();
+        symlink(&r8152, intf.join("driver")).unwrap();
+        iface("enx00e04c", &intf, &[("operstate", "down")]);
+
+        // Virtual: left out.
+        mk(&tmp.join("sys/class/net/virbr0"), &[("operstate", "up")]);
+
+        assert_eq!(
+            nets(&tmp),
+            [
+                "enp8s0 · Realtek RTL8126 5GbE Controller · r8169 driver · 5 Gb/s",
+                "enx00e04c · Realtek USB 10/100/1000 LAN · r8152 driver · down",
+                "wlan0 · Intel Wi-Fi card · iwlwifi driver",
+            ]
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn nvidia_driver_and_vbios() {
+        assert_eq!(
+            parse_nvidia_info("580.95.05, 98.03.3B.00.A8\n580.95.05, [N/A]\nNVIDIA-SMI has failed\n"),
+            [("580.95.05".to_string(), Some("98.03.3B.00.A8".to_string())), ("580.95.05".to_string(), None)]
+        );
     }
 
     #[test]

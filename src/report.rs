@@ -93,6 +93,18 @@ fn render(app: &App, now: &chrono::DateTime<chrono::Local>) -> String {
     if let Some((_, t)) = app.ram_temp() {
         let _ = writeln!(o, "RAM      {:<10} {}", deg(t), watts(&app.ram_power));
     }
+    if let Some(b) = &app.battery {
+        let state = match b.state {
+            crate::battery::State::Charging => "charging",
+            crate::battery::State::Discharging => "discharging",
+            crate::battery::State::Full => "full",
+            crate::battery::State::NotCharging => "plugged in, not charging",
+            crate::battery::State::Unknown => "state unknown",
+        };
+        let left = b.hours_left.map(|h| format!(" · {}", crate::battery::fmt_hours(h))).unwrap_or_default();
+        let rate = b.watts.map(|w| format!(" · {}", power::fmt_watts(w))).unwrap_or_default();
+        let _ = writeln!(o, "Battery  {:.0}% {state}{left}{rate}", b.percent);
+    }
     if let Some(h) = app.hottest() {
         let _ = writeln!(o, "Hottest  {} ({}) {}", h.label, h.device, deg(h.current.unwrap()));
     }

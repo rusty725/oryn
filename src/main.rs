@@ -35,6 +35,7 @@ use ratatui::{
 };
 #[cfg(target_os = "linux")]
 mod devnames;
+mod battery;
 mod gpu;
 
 /// Developer/test overrides: `ORYN_<KEY>` (or the pre-rename `TEMPMON_<KEY>`),
@@ -406,6 +407,8 @@ struct App {
     cpu_power: power::PowerMeter,
     /// RAM power draw (RAPL "dram" zone; most machines don't have one).
     ram_power: power::PowerMeter,
+    /// The system battery; None on desktops.
+    battery: Option<battery::Battery>,
     /// Process panel: selection, scroll, search, prompts.
     pv: panels::ProcView,
     /// Tab: arrow and action keys go to the process list instead of sensors.
@@ -444,6 +447,7 @@ impl App {
             specs: None,
             cpu_power: power::PowerMeter::cpu(&sysfs),
             ram_power: power::PowerMeter::dram(&sysfs),
+            battery: None,
             pv: Default::default(),
             focus_proc: false,
             squeezed: Default::default(),
@@ -474,6 +478,8 @@ impl App {
         } else {
             self.cpu_power.refresh();
             self.ram_power.refresh();
+            let root = crate::env_os("SYSFS").unwrap_or_else(|| "/".into());
+            self.battery = battery::read_battery(std::path::Path::new(&root));
         }
         let selected_id = self.selected().map(|s| s.id.clone());
         let mut seen = vec![false; self.sensors.len()];
@@ -853,8 +859,12 @@ impl App {
     }
 
     fn collect_specs(&mut self) {
-        let gpus: Vec<(String, Option<f64>)> =
-            self.gpu.gpus.iter().map(|g| (g.name.clone(), g.vram_total)).collect();
+        let gpus: Vec<specs::GpuSpec> = self
+            .gpu
+            .gpus
+            .iter()
+            .map(|g| specs::GpuSpec { name: g.name.clone(), vram: g.vram_total, nvidia: g.nvidia, vbios: g.vbios.clone() })
+            .collect();
         if self.specs.as_ref().is_some_and(|(_, n)| *n == gpus.len()) {
             return;
         }
@@ -2142,10 +2152,16 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     }
     // GPU, like the CPU: a badge colored by temperature, the temperature and
     // the power draw. With several cards: the hottest one's temperature and
-    // their power added up.
-    let gpu_t = app.gpu.gpus.iter().filter_map(|g| g.temp).reduce(f32::max);
-    let gpu_w: Vec<f32> = app.gpu.gpus.iter().filter_map(|g| g.power_w).collect();
-    if gpu_t.is_some() || !gpu_w.is_empty() {
+    // their power added up. An integrated GPU gets its own "iGPU" badge, so
+    // on a hybrid laptop its (CPU package) temperature isn't mixed with the
+    // discrete card's.
+    for (integrated, badge) in [(false, " GPU "), (true, " iGPU ")] {
+        let gpus = || app.gpu.gpus.iter().filter(move |g| g.on_cpu_die == integrated);
+        let gpu_t = gpus().filter_map(|g| g.temp).reduce(f32::max);
+        let gpu_w: Vec<f32> = gpus().filter_map(|g| g.power_w).collect();
+        if gpu_t.is_none() && gpu_w.is_empty() {
+            continue;
+        }
         // Same thresholds as the GPU panel's Temp.
         let c = match gpu_t {
             Some(t) if t >= 85.0 => th.crit,
@@ -2154,7 +2170,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             None => th.dim,
         };
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(" GPU ", Style::new().bold().fg(th.on_badge).bg(c)));
+        spans.push(Span::styled(badge, Style::new().bold().fg(th.on_badge).bg(c)));
         if let Some(t) = gpu_t {
             spans.push(Span::styled(format!(" {} ", app.unit.fmt(t)), Style::new().bold().fg(c)));
         } else {
@@ -2177,6 +2193,33 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             spans.push(Span::raw(" "));
         }
         if let Some(w) = app.ram_power.watts {
+            spans.push(Span::styled(format!("{} ", power::fmt_watts(w)), Style::new().fg(th.fg)));
+        }
+    }
+    // Battery, only where there is one (laptops, tablets, handhelds):
+    // "BAT 54% 2h 10m left 8.4 W", "BAT 87% charging 1h 05m 25 W", "BAT 100% full".
+    if let Some(b) = &app.battery {
+        let c = if b.percent <= 10.0 {
+            th.crit
+        } else if b.percent <= 25.0 {
+            th.warn
+        } else {
+            th.ok
+        };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(" BAT ", Style::new().bold().fg(th.on_badge).bg(c)));
+        spans.push(Span::styled(format!(" {:.0}% ", b.percent), Style::new().bold().fg(c)));
+        let left = b.hours_left.map(battery::fmt_hours);
+        let what = match (b.state, left) {
+            (battery::State::Discharging, Some(t)) => format!("{t} left "),
+            (battery::State::Charging, Some(t)) => format!("charging {t} "),
+            (battery::State::Charging, None) => "charging ".into(),
+            (battery::State::Full, _) => "full ".into(),
+            (battery::State::NotCharging, _) => "plugged in ".into(),
+            _ => String::new(),
+        };
+        spans.push(Span::styled(what, Style::new().fg(th.fg)));
+        if let Some(w) = b.watts {
             spans.push(Span::styled(format!("{} ", power::fmt_watts(w)), Style::new().fg(th.fg)));
         }
     }
@@ -2625,6 +2668,29 @@ mod render_fuzz {
                 });
             }
         }
+    }
+    #[test]
+    fn header_badges_igpu_separately() {
+        let mut a = app();
+        let gpu = |on_cpu_die, temp, power_w| gpustats::GpuView { on_cpu_die, temp: Some(temp), power_w, ..Default::default() };
+        let header = |a: &App| {
+            let mut t = Terminal::new(TestBackend::new(200, 3)).unwrap();
+            t.draw(|f| draw_header(f, a, f.area())).unwrap();
+            t.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>()
+        };
+        // Laptop with only the integrated GPU.
+        a.gpu.gpus = vec![gpu(true, 44.0, None)];
+        let h = header(&a);
+        assert!(h.contains(" iGPU  44.0°C") && !h.contains(" GPU "), "{h}");
+        // Hybrid laptop: each gets its own badge.
+        a.gpu.gpus = vec![gpu(true, 44.0, None), gpu(false, 61.0, Some(35.0))];
+        let h = header(&a);
+        assert!(h.contains(" GPU  61.0°C 35 W") && h.contains(" iGPU  44.0°C"), "{h}");
+        // No battery (a desktop): no badge. A laptop on battery: charge, time left, rate.
+        assert!(!h.contains("BAT"), "{h}");
+        a.battery = Some(battery::Battery { percent: 54.0, state: battery::State::Discharging, watts: Some(8.4), hours_left: Some(2.1667) });
+        let h = header(&a);
+        assert!(h.contains(" BAT  54% 2h 10m left 8.4 W"), "{h}");
     }
 }
 
