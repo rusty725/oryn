@@ -359,7 +359,7 @@ In the **v** menu (rows are listed in layout order):
 | Key | Action |
 |-----|--------|
 | Space | show / hide the highlighted panel |
-| Shift+↑ / Shift+↓ (or K / J) | move it up / down |
+| Ctrl+Shift+↑ / Ctrl+Shift+↓ (or K / J) | move it up / down (Shift+↑ / ↓ alone works too in terminals that don't use it for scrolling) |
 | ← / → (or h / l) | put it in the left / right column (wide terminals) |
 | d | back to the default layout |
 

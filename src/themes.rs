@@ -421,6 +421,11 @@ pub(crate) fn give_back(path: &std::path::Path) {
 
 /// Write one settings file (creating the folder if needed).
 pub fn write_config(name: &str, contents: &str) {
+    // Tests change the theme, layout and compact mode; they must never
+    // overwrite the settings of whoever runs them.
+    if cfg!(test) {
+        return;
+    }
     let Some(dir) = config_dir() else { return };
     let fresh = !dir.exists();
     if std::fs::create_dir_all(&dir).is_err() {

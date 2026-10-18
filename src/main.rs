@@ -143,7 +143,7 @@ fn panels_file() -> Option<std::path::PathBuf> {
 /// The saved file lists every panel, hidden ones with a leading "-"
 /// ("sensors,cpu,-proc"). Panels it doesn't mention — ones added in a newer
 /// version — start shown.
-/// User-arranged panel order and columns (the `v` menu: Shift+↑/↓, ←/→).
+/// User-arranged panel order and columns (the `v` menu: Ctrl+Shift+↑/↓, ←/→).
 #[derive(Clone, PartialEq, Debug)]
 struct PanelLayout {
     /// Panel indices, top to bottom.
@@ -826,7 +826,8 @@ impl App {
             save_panels(&app.show, &app.lay);
         };
         match code {
-            // Move the highlighted panel: Shift+↑/↓ or K/J.
+            // Move the highlighted panel: Ctrl+Shift+↑/↓ (Shift alone works
+            // too, but some terminals keep Shift+↑/↓ for scrolling) or K/J.
             KeyCode::Up if shift => moved(self, -1),
             KeyCode::Down if shift => moved(self, 1),
             KeyCode::Char('K') => moved(self, -1),
@@ -2054,7 +2055,7 @@ fn draw_compact(f: &mut Frame, app: &App, area: Rect) {
 fn draw_view_menu(f: &mut Frame, app: &mut App) {
     let th = app.th();
     let area = f.area();
-    let w = 68.min(area.width);
+    let w = 84.min(area.width);
     let h = (PANELS.len() as u16 + 2).min(area.height);
     let popup = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h);
     let items: Vec<ListItem> = app
@@ -2082,7 +2083,7 @@ fn draw_view_menu(f: &mut Frame, app: &mut App) {
         .block(
             panel(&th, Line::from(format!(" Panels · {mode} ")))
                 .title_bottom(
-                    Line::from(" Space show/hide · Shift+↑↓ move · ←→ column · d default · Esc ")
+                    Line::from(" Space show/hide · Ctrl+Shift+↑/↓ move · ←/→ column · d default · Esc close ")
                         .style(Style::new().fg(th.dim)),
                 )
                 .style(Style::new().bg(th.bg)),
@@ -2682,6 +2683,21 @@ mod render_fuzz {
             }
         }
     }
+    #[test]
+    fn panel_menu_spells_out_the_move_keys() {
+        let mut a = app();
+        a.view = Some(ListState::default().with_selected(Some(0)));
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        t.draw(|f| draw(f, &mut a)).unwrap();
+        let text: String = t.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Space show/hide · Ctrl+Shift+↑/↓ move · ←/→ column · d default · Esc close"), "{text}");
+
+        // Ctrl+Shift+↓ moves the highlighted panel down one place.
+        let first = a.lay.order[0];
+        a.view_key(KeyCode::Down, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(a.lay.order[1], first);
+    }
+
     #[test]
     fn header_badges_igpu_separately() {
         let mut a = app();
