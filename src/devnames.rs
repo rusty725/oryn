@@ -65,9 +65,10 @@ impl Namer {
         // Chips we recognise by name (motherboard sensor chips, ACPI, …).
         // Checked before PCI so a known chip isn't renamed after its bus.
         if let Some((name, tag)) = generic(&chip_l) {
-            // Network chips sit on a PHY below the PCI card; the card's own
-            // name ("Realtek RTL8125 2.5GbE Controller") is better if found.
-            if tag == "NET"
+            // Network and Wi-Fi chips: the card's own name ("Realtek RTL8125
+            // 2.5GbE Controller", "Intel Raptor Lake PCH CNVi WiFi") is
+            // better if found (an Ethernet chip's hwmon sits on a PHY below it).
+            if matches!(tag, "NET" | "WIFI")
                 && let Some(p) = self.pci(&dev) {
                     return (p.0, tag);
                 }
@@ -372,6 +373,26 @@ mod tests {
         let (v, d) = lookup_pci(db, 0x8086, 0x2725).unwrap();
         assert_eq!(pci_display(&v, &d, false), "Intel Wi-Fi 6E(802.11ax) AX210/AX1675* 2x2");
         assert!(lookup_pci(db, 0x1002, 0x2684).is_none()); // device under wrong vendor
+    }
+
+    #[test]
+    fn wifi_card_named_from_pci_ids() {
+        let tmp = std::env::temp_dir().join(format!("oryn-wifi-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let card = tmp.join("sys/devices/pci0000:00/0000:00:14.3");
+        let hwmon = card.join("hwmon/hwmon5");
+        fs::create_dir_all(&hwmon).unwrap();
+        for (f, v) in [("vendor", "0x8086"), ("device", "0x51f1"), ("class", "0x028000")] {
+            fs::write(card.join(f), format!("{v}\n")).unwrap();
+        }
+        std::os::unix::fs::symlink(&card, hwmon.join("device")).unwrap();
+        // Without pci.ids: the generic name.
+        assert_eq!(Namer::new(&tmp).hwmon("iwlwifi_1", &hwmon), ("Intel Wi-Fi card".to_string(), "WIFI"));
+        // With it: the card's own name, like the specs panel.
+        fs::create_dir_all(tmp.join("usr/share/hwdata")).unwrap();
+        fs::write(tmp.join("usr/share/hwdata/pci.ids"), "8086  Intel Corporation\n\t51f1  Raptor Lake PCH CNVi WiFi\n").unwrap();
+        assert_eq!(Namer::new(&tmp).hwmon("iwlwifi_1", &hwmon), ("Intel Raptor Lake PCH CNVi WiFi".to_string(), "WIFI"));
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

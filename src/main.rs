@@ -2245,8 +2245,9 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::new().fg(th.border));
     let inner = block.inner(area);
 
-    // Clock, right-aligned: "Fri 16 Oct · 15:14:07". If the header text would
-    // run into it, drop the date; the text is then cut short before the time.
+    // Clock and version, right-aligned: "Fri 16 Oct · 15:14:07 · v0.1.4". If
+    // the header text would run into it, drop the date and version; the text
+    // is then cut short before the time.
     let now = chrono::Local::now();
     let time = Span::styled(now.format("%H:%M:%S").to_string(), Style::new().fg(th.accent).bold());
     let text_w = Line::from(spans.clone()).width() as u16;
@@ -2254,6 +2255,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(now.format("%a %d %b").to_string(), Style::new().fg(th.dim)),
         Span::styled("  ·  ", Style::new().fg(th.dim)),
         time.clone(),
+        Span::styled(concat!("  ·  v", env!("CARGO_PKG_VERSION")), Style::new().fg(th.dim)),
         Span::raw(" "),
     ]);
     let clock = if text_w + 2 + full.width() as u16 <= inner.width { full } else { Line::from(vec![time, Span::raw(" ")]) };
@@ -2674,7 +2676,7 @@ mod render_fuzz {
         let mut a = app();
         let gpu = |on_cpu_die, temp, power_w| gpustats::GpuView { on_cpu_die, temp: Some(temp), power_w, ..Default::default() };
         let header = |a: &App| {
-            let mut t = Terminal::new(TestBackend::new(200, 3)).unwrap();
+            let mut t = Terminal::new(TestBackend::new(300, 3)).unwrap();
             t.draw(|f| draw_header(f, a, f.area())).unwrap();
             t.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>()
         };
@@ -2691,6 +2693,7 @@ mod render_fuzz {
         a.battery = Some(battery::Battery { percent: 54.0, state: battery::State::Discharging, watts: Some(8.4), hours_left: Some(2.1667) });
         let h = header(&a);
         assert!(h.contains(" BAT  54% 2h 10m left 8.4 W"), "{h}");
+        assert!(h.contains(concat!(" ·  v", env!("CARGO_PKG_VERSION"))), "version after the clock: {h}");
     }
 }
 

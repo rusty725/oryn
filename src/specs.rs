@@ -165,9 +165,12 @@ impl Specs {
                 } else {
                     "SSD"
                 };
-                // NVMe: the controller's full firmware revision. SATA/SCSI:
-                // `rev`, which the kernel cuts to its last 4 characters.
-                let firmware = read(&dir.join("device/firmware_rev")).or_else(|| read(&dir.join("device/rev")));
+                // NVMe: the controller's firmware revision. SATA: the full one
+                // from the drive's ATA identify data. Else (USB, SAS) `rev`,
+                // which the kernel cuts to its last 4 characters.
+                let firmware = read(&dir.join("device/firmware_rev"))
+                    .or_else(|| ata_firmware(&dir.join("device")))
+                    .or_else(|| read(&dir.join("device/rev")));
                 Some((model, sectors * 512.0, kind, firmware))
             })
             .collect();
@@ -228,6 +231,47 @@ fn nets(root: &Path) -> Vec<String> {
         .collect();
     nets.sort();
     nets
+}
+
+/// A SATA drive's full firmware revision ("01.01A01"), from the ATA
+/// identify data libata publishes, readable without root. `dev` is the
+/// disk's SCSI device; the ATA port ("ataN") is above it. Used only when
+/// the port has one drive (not behind a port multiplier), so it can't be
+/// mixed up with another disk's.
+fn ata_firmware(dev: &Path) -> Option<String> {
+    let dev = fs::canonicalize(dev).ok()?;
+    let port = dev.ancestors().find(|d| {
+        d.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix("ata")).is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+    })?;
+    let ls = |d: &Path, prefix: &str| -> Vec<PathBuf> {
+        fs::read_dir(d)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .map(|e| e.path())
+            .collect()
+    };
+    let ids: Vec<PathBuf> = ls(port, "link")
+        .iter()
+        .flat_map(|l| ls(l, "dev"))
+        .flat_map(|d| ls(&d.join("ata_device"), "dev"))
+        .map(|d| d.join("id"))
+        .filter(|f| f.is_file())
+        .collect();
+    match ids.as_slice() {
+        [id] => identify_string(&fs::read_to_string(id).ok()?, 23..27),
+        _ => None,
+    }
+}
+
+/// ASCII text from ATA identify data (256 16-bit words written as hex,
+/// e.g. "427a 3fff …"); each word holds two characters, high byte first.
+fn identify_string(id: &str, words: std::ops::Range<usize>) -> Option<String> {
+    let all: Vec<u16> = id.split_whitespace().filter_map(|w| u16::from_str_radix(w, 16).ok()).collect();
+    let bytes: Vec<u8> = all.get(words)?.iter().flat_map(|w| w.to_be_bytes()).collect();
+    let s = String::from_utf8_lossy(&bytes).trim().to_string();
+    (!s.is_empty() && s.chars().all(|c| c.is_ascii_graphic() || c == ' ')).then_some(s)
 }
 
 /// The network adapter at `dev` (the interface's `device` link): the USB
@@ -571,6 +615,35 @@ mod tests {
                 "wlan0 · Intel Wi-Fi card · iwlwifi driver",
             ]
         );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn full_sata_firmware_from_identify_data() {
+        // The start of a WD4006FZBX's identify data: firmware "01.01A01"
+        // (words 23–26), where the kernel's `rev` says only "1A01".
+        let id = "427a 3fff c837 0010 0000 0000 003f 0000\n\
+                  0000 0000 2020 2020 2020 2020 2057 442d\n\
+                  4153 3036 3330 3952 0000 0000 0000 3031\n\
+                  2e30 3141 3031 5744 4320 5744 3430 3036\n";
+        assert_eq!(identify_string(id, 23..27).as_deref(), Some("01.01A01"));
+        assert_eq!(identify_string(id, 23..40), None, "past the end");
+        assert_eq!(identify_string("0000 0000", 0..2), None, "no text");
+
+        let tmp = std::env::temp_dir().join(format!("oryn-ata-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let port = tmp.join("pci/ata1");
+        let scsi = port.join("host0/target0:0:0/0:0:0:0");
+        fs::create_dir_all(&scsi).unwrap();
+        let ata_dev = port.join("link1/dev1.0/ata_device/dev1.0");
+        fs::create_dir_all(&ata_dev).unwrap();
+        fs::write(ata_dev.join("id"), id).unwrap();
+        assert_eq!(ata_firmware(&scsi).as_deref(), Some("01.01A01"));
+        // A second drive on the port (port multiplier): don't guess.
+        let other = port.join("link1.1/dev1.1.0/ata_device/dev1.1.0");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("id"), id).unwrap();
+        assert_eq!(ata_firmware(&scsi), None);
         let _ = fs::remove_dir_all(&tmp);
     }
 

@@ -290,8 +290,8 @@ exited, waiting for their parent to collect them) aren't listed.
 ## Header
 
 The top bar shows the temperature and power draw of the CPU, the GPU and the
-RAM, the hottest sensor and a clock (local date and time, ticking every
-second): `CPU 63.1°C 87 W   GPU 52.0°C 254 W   RAM 41.5°C 5.2 W · hottest …`.
+RAM, the hottest sensor, a clock (local date and time, ticking every
+second) and Oryn's version: `CPU 63.1°C 87 W   GPU 52.0°C 254 W   RAM 41.5°C 5.2 W · hottest …`.
 Each badge is colored by its temperature (green, yellow, red). With several
 graphics cards, the GPU badge shows the hottest card and their power added up;
 with several memory sticks, the RAM badge shows the hottest one.
