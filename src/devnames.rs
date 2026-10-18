@@ -69,7 +69,7 @@ impl Namer {
             // 2.5GbE Controller", "Intel Raptor Lake PCH CNVi WiFi") is
             // better if found (an Ethernet chip's hwmon sits on a PHY below it).
             if matches!(tag, "NET" | "WIFI")
-                && let Some(p) = self.pci(&dev) {
+                && let Some(p) = self.pci(&dev).or_else(|| self.pci_by_driver(&chip_l)) {
                     return (p.0, tag);
                 }
             return (name, tag);
@@ -87,7 +87,36 @@ impl Namer {
         if is_cpu_name(&k) {
             return (self.cpu(), "CPU");
         }
-        generic(&k).unwrap_or_else(|| (kind.to_string(), ""))
+        match generic(&k) {
+            // A Wi-Fi card's zone ("iwlwifi_1") isn't linked to the card.
+            Some((_, "WIFI")) if let Some((name, _)) = self.pci_by_driver(&k) => (name, "WIFI"),
+            Some(g) => g,
+            None => (kind.to_string(), ""),
+        }
+    }
+
+    /// The PCI device bound to the driver a sensor is named after
+    /// ("iwlwifi_1" → iwlwifi), for sensors with no link to their card
+    /// (thermal zones). Only when exactly one device uses that driver.
+    fn pci_by_driver(&mut self, chip: &str) -> Option<(String, &'static str)> {
+        let drivers = self.root.join("sys/bus/pci/drivers");
+        let driver = fs::read_dir(&drivers)
+            .ok()?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|d| chip.starts_with(d.as_str()))
+            .max_by_key(|d| d.len())?;
+        // Bound devices appear as links named by PCI address ("0000:00:14.3").
+        let devs: Vec<PathBuf> = fs::read_dir(drivers.join(&driver))
+            .ok()?
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().matches(':').count() == 2)
+            .map(|e| e.path())
+            .collect();
+        match devs.as_slice() {
+            [d] => self.pci(d),
+            _ => None,
+        }
     }
 
     /// Name of the PCI device at `dir` (e.g. "NVIDIA GeForce RTX 5090").
@@ -290,6 +319,65 @@ fn parse_spd(b: &[u8]) -> Option<String> {
     }
 }
 
+/// Each installed memory module as the BIOS describes it (SMBIOS type 17,
+/// `/sys/firmware/dmi/entries/17-*/raw`): "Samsung K3KL8L80CM-MGCT". This
+/// covers soldered memory (most laptops), which has no SPD chip to read.
+/// The entries are readable by root only; without root this is empty.
+pub fn dmi_memory(root: &Path) -> Vec<String> {
+    let mut entries: Vec<PathBuf> = fs::read_dir(root.join("sys/firmware/dmi/entries"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("17-"))
+        .map(|e| e.path().join("raw"))
+        .collect();
+    entries.sort();
+    entries.iter().filter_map(|p| fs::read(p).ok()).filter_map(|b| parse_dmi_memory(&b)).collect()
+}
+
+fn parse_dmi_memory(b: &[u8]) -> Option<String> {
+    // Formatted area: type 17, its length at byte 1; size (word) at 0x0C,
+    // manufacturer and part number string numbers at 0x17 and 0x1A. The
+    // numbered strings follow the formatted area, each NUL-terminated.
+    let len = *b.get(1)? as usize;
+    if *b.first()? != 17 || len < 0x1B || b.len() < len {
+        return None;
+    }
+    let size = u16::from_le_bytes([b[0x0C], b[0x0D]]);
+    if size == 0 {
+        return None; // empty slot
+    }
+    let strings: Vec<&[u8]> = b[len..].split(|&c| c == 0).take_while(|s| !s.is_empty()).collect();
+    let string = |n: u8| -> Option<String> {
+        let s = String::from_utf8_lossy(strings.get((n as usize).checked_sub(1)?)?).trim().to_string();
+        let junk = ["", "Unknown", "Not Specified", "NO DIMM", "Undefined", "0000", "00000000"];
+        (!junk.iter().any(|j| s.eq_ignore_ascii_case(j)) && !s.starts_with("Manufacturer") && !s.starts_with("PartNum"))
+            .then_some(s)
+    };
+    let part = string(b[0x1A]);
+    let maker = string(b[0x17]).map(|m| dmi_maker(&m));
+    match (maker, part) {
+        (Some(m), Some(p)) if !p.to_ascii_lowercase().starts_with(&m.to_ascii_lowercase()) => Some(format!("{m} {p}")),
+        (_, Some(p)) => Some(p),
+        (Some(m), None) => Some(format!("{m} RAM")),
+        (None, None) => None,
+    }
+}
+
+/// Some BIOSes give the maker as a JEDEC ID in hex ("80CE000080CE",
+/// "Unknown (80AD)"); turn those into names where known.
+fn dmi_maker(s: &str) -> String {
+    let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() >= 4 && (hex.len() == s.len() || s.contains('(')) {
+        let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+        if let (Some(bank), Some(id)) = (byte(0), byte(2))
+            && let Some(name) = jedec_maker(bank & 0x7f, id & 0x7f) {
+                return name.to_string();
+            }
+    }
+    s.to_string()
+}
+
 /// (continuation-code count, ID without parity bit) -> name, for common RAM makers.
 fn jedec_maker(bank: u8, id: u8) -> Option<&'static str> {
     Some(match (bank, id) {
@@ -392,6 +480,60 @@ mod tests {
         fs::create_dir_all(tmp.join("usr/share/hwdata")).unwrap();
         fs::write(tmp.join("usr/share/hwdata/pci.ids"), "8086  Intel Corporation\n\t51f1  Raptor Lake PCH CNVi WiFi\n").unwrap();
         assert_eq!(Namer::new(&tmp).hwmon("iwlwifi_1", &hwmon), ("Intel Raptor Lake PCH CNVi WiFi".to_string(), "WIFI"));
+
+        // Its thermal zone has no link to the card: found through the driver.
+        assert_eq!(Namer::new(&tmp).zone("iwlwifi_1"), ("Intel Wi-Fi card".to_string(), "WIFI"), "driver unknown");
+        let drv = tmp.join("sys/bus/pci/drivers/iwlwifi");
+        fs::create_dir_all(&drv).unwrap();
+        std::os::unix::fs::symlink(&card, drv.join("0000:00:14.3")).unwrap();
+        assert_eq!(Namer::new(&tmp).zone("iwlwifi_1"), ("Intel Raptor Lake PCH CNVi WiFi".to_string(), "WIFI"));
+        // Two cards on the same driver: can't tell which, keep it generic.
+        std::os::unix::fs::symlink(&card, drv.join("0000:05:00.0")).unwrap();
+        assert_eq!(Namer::new(&tmp).zone("iwlwifi_1"), ("Intel Wi-Fi card".to_string(), "WIFI"));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dmi_memory_modules() {
+        // A type 17 entry: 0x28-byte formatted area, then its strings.
+        let entry = |size: u16, maker: &str, part: &str| {
+            let mut b = vec![0u8; 0x28];
+            b[0] = 17;
+            b[1] = 0x28;
+            b[0x0C..0x0E].copy_from_slice(&size.to_le_bytes());
+            b[0x10] = 1; // device locator
+            b[0x17] = 2; // manufacturer
+            b[0x1A] = 3; // part number
+            for s in ["Controller0-ChannelA", maker, part] {
+                b.extend_from_slice(s.as_bytes());
+                b.push(0);
+            }
+            b.push(0);
+            b
+        };
+        assert_eq!(parse_dmi_memory(&entry(2048, "Samsung", "K3KL8L80CM-MGCT")).as_deref(), Some("Samsung K3KL8L80CM-MGCT"));
+        // JEDEC IDs in hex, trailing spaces, maker already in the part number.
+        assert_eq!(parse_dmi_memory(&entry(8192, "80AD000080AD", "HMCG88AGBSA092N     ")).as_deref(), Some("SK hynix HMCG88AGBSA092N"));
+        assert_eq!(parse_dmi_memory(&entry(16384, "Kingston", "Kingston KF560C36-32")).as_deref(), Some("Kingston KF560C36-32"));
+        // Micron, by name or by JEDEC ID (with and without the "Unknown (…)" wrapper).
+        assert_eq!(parse_dmi_memory(&entry(2048, "Micron Technology", "MT62F1G32D4DR-031 WT:B")).as_deref(), Some("Micron Technology MT62F1G32D4DR-031 WT:B"));
+        assert_eq!(parse_dmi_memory(&entry(2048, "802C0000802C", "MT62F1G32D4DR-031")).as_deref(), Some("Micron MT62F1G32D4DR-031"));
+        assert_eq!(parse_dmi_memory(&entry(2048, "802C", "MT62F1G32D4DR-031")).as_deref(), Some("Micron MT62F1G32D4DR-031"));
+        assert_eq!(parse_dmi_memory(&entry(2048, "Unknown (802C)", "MT62F1G32D4DR-031")).as_deref(), Some("Micron MT62F1G32D4DR-031"));
+        // Empty slot, and placeholder strings.
+        assert_eq!(parse_dmi_memory(&entry(0, "Samsung", "X")), None);
+        assert_eq!(parse_dmi_memory(&entry(4096, "Not Specified", "Not Specified")), None);
+        assert_eq!(parse_dmi_memory(&[1, 4, 0, 0]), None, "not type 17");
+
+        let tmp = std::env::temp_dir().join(format!("oryn-dmi-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        for (i, size) in [(0, 2048), (1, 0), (2, 2048)] {
+            let d = tmp.join(format!("sys/firmware/dmi/entries/17-{i}"));
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("raw"), entry(size, "Micron", "MT62F1G32D4DR-031")).unwrap();
+        }
+        assert_eq!(dmi_memory(&tmp), ["Micron MT62F1G32D4DR-031", "Micron MT62F1G32D4DR-031"]);
+        assert!(dmi_memory(&tmp.join("nothing")).is_empty());
         let _ = fs::remove_dir_all(&tmp);
     }
 

@@ -868,8 +868,19 @@ impl App {
         if self.specs.as_ref().is_some_and(|(_, n)| *n == gpus.len()) {
             return;
         }
-        let dimms: Vec<String> =
+        #[allow(unused_mut)]
+        let mut dimms: Vec<String> =
             self.sensors.iter().filter(|s| s.kind == "RAM").map(|s| s.device.clone()).collect();
+        // No stick named from its SPD chip (soldered memory has none, or no
+        // root): the BIOS's own list of modules, if readable.
+        #[cfg(target_os = "linux")]
+        if dimms.iter().all(|d| d.starts_with("RAM DIMM")) {
+            let root = crate::env_os("SYSFS").unwrap_or_else(|| "/".into());
+            let dmi = devnames::dmi_memory(std::path::Path::new(&root));
+            if !dmi.is_empty() {
+                dimms = dmi;
+            }
+        }
         let sys = sysinfo::System::new_with_specifics(
             sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()),
         );

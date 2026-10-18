@@ -458,8 +458,10 @@ On Linux each row shows the hardware it belongs to:
 
 RAM part numbers need the DIMM's SPD EEPROM to be readable, which on most
 systems means running as root (`sudo oryn`). Without it, sticks show as
-`RAM DIMM @0x50`, `@0x51`, … (their bus address). GPU names need `pci.ids`
-(package `hwdata` or `pciutils`).
+`RAM DIMM @0x50`, `@0x51`, … (their bus address). Memory soldered to the
+board (most laptops) has no SPD chip; the specs panel then lists the modules
+the BIOS reports (SMBIOS type 17), which also needs root. GPU names need
+`pci.ids` (package `hwdata` or `pciutils`).
 
 ## GPU temperatures
 
