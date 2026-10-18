@@ -1,0 +1,46 @@
+# Maintainer: rusty725 <rusty725@users.noreply.github.com>
+pkgname=oryn
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Terminal hardware monitor: every temperature sensor plus btop-style CPU, GPU, memory, disk, network and process panels'
+arch=('x86_64' 'aarch64')
+url='https://github.com/rusty725/oryn'
+license=('MIT' 'Apache-2.0' 'ISC' 'Zlib' 'Unicode-3.0' 'BSL-1.0' 'Unlicense')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo')
+optdepends=(
+  'smartmontools: temperatures of SATA/USB drives without the drivetemp driver'
+  'nvidia-utils: NVIDIA GPU temperatures, usage, VRAM, hotspot and VRAM chips'
+  'hwdata: readable names for PCI devices (GPUs, network cards, USB controllers)'
+)
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# After pushing the v0.1.0 tag to GitHub, run `updpkgsums` to fill this in.
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm0755 -t "$pkgdir/usr/bin/" target/release/oryn
+  install -Dm0644 -t "$pkgdir/usr/share/licenses/$pkgname/" LICENSE THIRD_PARTY_NOTICES.md LICENSES-dependencies.txt
+  install -Dm0644 -t "$pkgdir/usr/share/doc/$pkgname/" README.md
+  install -Dm0644 -t "$pkgdir/usr/share/man/man1/" doc/oryn.1
+}

@@ -1,0 +1,61 @@
+# Fedora / RHEL-family spec for oryn. Builds from the GitHub release with cargo.
+#   rpmbuild -ba oryn.spec        (after putting the source tarball in SOURCES/)
+#   or: spectool -g -R oryn.spec && rpmbuild -ba oryn.spec
+# The Cargo release profile already strips the binary, so there is no
+# debuginfo to split off.
+%global debug_package %{nil}
+# Docs and licenses in /usr/share/{doc,licenses}/oryn, as on Fedora.
+%global _docdir_fmt %{name}
+
+Name:           oryn
+Version:        0.1.0
+Release:        1%{?dist}
+Summary:        Terminal hardware monitor with every temperature sensor
+
+# oryn is MIT; the rest are the Rust crates compiled into the binary
+# (see LICENSES-dependencies.txt).
+License:        MIT AND ISC AND Zlib AND Unicode-3.0 AND (MIT OR Apache-2.0) AND (Unlicense OR MIT) AND (Apache-2.0 OR BSL-1.0) AND (Apache-2.0 WITH LLVM-exception OR MIT OR Apache-2.0)
+URL:            https://github.com/rusty725/oryn
+Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
+
+ExclusiveArch:  x86_64 aarch64
+BuildRequires:  cargo >= 1.85
+BuildRequires:  rust >= 1.85
+BuildRequires:  gcc
+
+Recommends:     smartmontools
+Recommends:     hwdata
+
+%description
+Oryn shows every temperature sensor in the machine in one table: CPU cores,
+GPU edge, hotspot and individual VRAM chips, each RAM stick, NVMe, SATA and
+USB drives, chipset and network cards, each named after its hardware and with
+min/max, trend and a history graph.
+
+Around it sit btop-style panels for CPU (with live clock speed and per-core
+temperatures), GPU (NVIDIA and AMD), memory, disks, network, processes (with
+search, terminate, kill and nice) and system specs. 100 color schemes,
+compact mode and mouse support.
+
+%prep
+%autosetup -n %{name}-%{version}
+
+%build
+cargo build --release --locked
+
+%check
+cargo test --release --locked
+
+%install
+install -Dm0755 target/release/oryn %{buildroot}%{_bindir}/oryn
+install -Dm0644 doc/oryn.1 %{buildroot}%{_mandir}/man1/oryn.1
+
+%files
+%license LICENSE THIRD_PARTY_NOTICES.md LICENSES-dependencies.txt
+%doc README.md
+%{_bindir}/oryn
+%{_mandir}/man1/oryn.1*
+
+%changelog
+* Fri Oct 16 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.0-1
+- First release.

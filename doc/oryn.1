@@ -1,0 +1,98 @@
+.TH ORYN 1 "October 2026" "oryn 0.1.0" "User Commands"
+.SH NAME
+oryn \- terminal hardware monitor with every temperature sensor
+.SH SYNOPSIS
+.B oryn
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B oryn
+shows every temperature sensor in the machine (CPU, GPU with hotspot and
+VRAM chips, RAM, NVMe, SATA and USB drives, chipset, network cards) in one
+table, with btop-style panels for CPU, GPU, memory, disks, network,
+processes and system specs.
+.PP
+A few readings need root: SMART drive temperatures, RAM part numbers, CPU
+power draw and the hotspot of NVIDIA RTX 50 cards. Run \fBsudo oryn\fR for those; your own
+user's settings are used either way.
+.SH OPTIONS
+.TP
+.B \-\-demo
+Use simulated sensors (virtual machines, containers, trying the interface).
+.TP
+.B \-\-list
+Print every detected sensor once and exit.
+.TP
+.BR \-i ", " \-\-interval " \fIms\fR"
+Refresh interval in milliseconds, 100 to 10000 (default 1000).
+.TP
+.BI \-\-theme " name"
+Color scheme, e.g. \fBdracula\fR, \fBnord\fR, \fBtokyo-night\fR.
+.TP
+.B \-\-themes
+List the 100 available color schemes.
+.TP
+.BI \-\-panels " list"
+Panels to show: a comma list of \fBsensors\fR, \fBhistory\fR, \fBcpu\fR,
+\fBmem\fR, \fBdisks\fR, \fBnet\fR, \fBproc\fR, \fBgpu\fR, \fBspecs\fR, or
+\fBall\fR; a leading \fB\-\fR hides one (\fBall,\-proc\fR).
+.TP
+.B \-\-compact
+Start in compact mode: temperatures only, no graphs or bars.
+.TP
+.B \-\-gpu\-info
+Explain which NVIDIA hotspot and VRAM temperatures can be read, and why not.
+.TP
+.B \-\-no\-nvapi
+Don't load NVIDIA's NvAPI library.
+.TP
+.BR \-h ", " \-\-help
+Show a short help.
+.SH KEYS
+.TP
+.B q, Esc
+Quit.
+.TP
+.B \(ua \(da, k j
+Select a sensor (its history is graphed).
+.TP
+.B Tab
+Move the keys between the sensor table and the process list.
+.TP
+.B 1\(en9, v
+Show or hide panels; \fBv\fR opens a list where panels can also be moved
+between columns and reordered.
+.TP
+.B c
+Compact mode.
+.TP
+.B t, T
+Pick a color scheme (live preview), or switch to the next one.
+.TP
+.B u
+Toggle \(deC / \(deF.
+.TP
+.B + \-
+Refresh interval up or down by 100 ms.
+.TP
+.B s, r
+Sort sensors by name or temperature; reset min/max.
+.TP
+.B l, L
+Write everything shown (header, every sensor, each visible panel) to
+\fI/tmp/oryn\-<date>\-<time>.log\fR, readable by you only.
+.TP
+.B p, n
+Process sort order; next network interface.
+.PP
+In the process list: \fBf\fR or \fB/\fR filter, \fBe\fR start a command,
+\fBt\fR terminate, \fBk\fR kill, \fBn\fR set nice.
+.SH FILES
+.TP
+.I ~/.config/oryn/
+Saved theme, panels, layout and compact mode.
+.SH SEE ALSO
+.BR sensors (1),
+.BR smartctl (8),
+.BR btop (1)
+.PP
+https://github.com/rusty725/oryn
