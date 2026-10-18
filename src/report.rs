@@ -205,8 +205,9 @@ fn render(app: &App, now: &chrono::DateTime<chrono::Local>) -> String {
             let _ = writeln!(o, "{}", g.name);
             let _ = writeln!(
                 o,
-                "  temp {} · hotspot {} · VRAM {}",
+                "  temp {}{} · hotspot {} · VRAM {}",
                 opt(g.temp, deg),
+                if g.on_cpu_die { " (iGPU)" } else { "" },
                 opt(g.hotspot, deg) + &g.hotspot_note.map(|n| format!(" ({n})")).unwrap_or_default(),
                 opt(g.vram_temp, deg)
             );

@@ -913,7 +913,8 @@ fn draw_one_gpu(f: &mut Frame, area: Rect, g: &crate::gpustats::GpuView, show_na
     };
     if let Some(t) = g.temp {
         let c = if t >= 85.0 { th.crit } else if t >= 70.0 { th.warn } else { th.ok };
-        add("Temp", deg(t), Style::new().fg(c));
+        let src = if g.on_cpu_die { " (iGPU)" } else { "" };
+        add("Temp", format!("{}{src}", deg(t)), Style::new().fg(c));
     }
     match g.hotspot {
         Some(t) => {
@@ -949,7 +950,8 @@ fn draw_one_gpu(f: &mut Frame, area: Rect, g: &crate::gpustats::GpuView, show_na
         add("Fan", format!("{fan:.0}%"), v);
     }
     if let Some(mhz) = g.core_mhz {
-        add("Core", format!("{mhz:.0} MHz"), v);
+        // 0 while the GPU sleeps between frames.
+        add("Core", if mhz > 0.0 { format!("{mhz:.0} MHz") } else { "idle".into() }, v);
     }
     if let Some(mhz) = g.mem_mhz {
         add("Mem", format!("{mhz:.0} MHz"), v);
@@ -1021,4 +1023,27 @@ pub fn draw_specs(f: &mut Frame, area: Rect, specs: Option<&crate::specs::Specs>
         })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn integrated_gpu_temp_and_idle_clock() {
+        let g = crate::gpustats::GpuView {
+            name: "Intel Iris Xe Graphics".into(),
+            util: Some(6.0),
+            temp: Some(44.0),
+            on_cpu_die: true,
+            core_mhz: Some(0.0),
+            ..Default::default()
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 9)).unwrap();
+        term.draw(|f| draw_gpu(f, f.area(), &[g], &crate::themes::THEMES[0], 8, false)).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Temp 44°C (iGPU)"), "{text}");
+        assert!(text.contains("Core idle"), "{text}");
+    }
 }

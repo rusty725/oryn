@@ -29,6 +29,9 @@ pub struct GpuView {
     pub nvidia: bool,
     /// Why hotspot is missing ("needs root"…), when known.
     pub hotspot_note: Option<&'static str>,
+    /// An integrated GPU with no sensor of its own: `temp` is filled in with
+    /// the CPU package temperature (same chip) once the sensors are read.
+    pub on_cpu_die: bool,
     pub power_w: Option<f32>,
     pub power_limit_w: Option<f32>,
     pub fan_pct: Option<f32>,
@@ -77,6 +80,7 @@ impl GpuStats {
                         hotspot: None,
                         nvidia: true,
                         hotspot_note: None,
+                        on_cpu_die: false,
                         vram_chips: Vec::new(),
                         power_w: g.power_w,
                         power_limit_w: g.power_limit_w,
@@ -244,6 +248,7 @@ mod amd {
                 vram_crit: crit_by_label(&["mem", "memory", "vram"]).map(|m| (m / 1000.0) as f32),
                 nvidia: false,
                 hotspot_note: None,
+                on_cpu_die: false,
                 vram_chips: Vec::new(),
                 // Microwatts. Newer kernels have power1_input, older power1_average.
                 power_w: h("power1_input").or_else(|| h("power1_average")).map(|u| (u / 1e6) as f32),
@@ -263,7 +268,8 @@ mod amd {
 /// root (the perf PMU, as intel_gpu_top uses). What any user can read is how
 /// long the GPU has spent powered down in its idle state (RC6 / C6), so usage
 /// is shown as the share of time it was awake. Integrated GPUs have no
-/// temperature sensor or VRAM of their own, so those stay n/a.
+/// temperature sensor or VRAM of their own: they get the CPU package
+/// temperature (`on_cpu_die`), and VRAM stays n/a.
 #[cfg(target_os = "linux")]
 mod intel {
     use super::GpuView;
@@ -278,6 +284,8 @@ mod intel {
         freq: PathBuf,
         /// Milliseconds spent idle since boot.
         idle: PathBuf,
+        /// No hwmon (discrete Arc cards have one): built into the CPU.
+        integrated: bool,
         last: Option<(u64, Instant)>,
     }
 
@@ -315,7 +323,8 @@ mod intel {
                     return None;
                 };
                 let display = crate::devnames::Namer::new(root).pci_name(&dev).unwrap_or_else(|| "Intel GPU".into());
-                Some(Card { id: name, name: display, freq, idle, last: None })
+                let integrated = !dev.join("hwmon").exists();
+                Some(Card { id: name, name: display, freq, idle, integrated, last: None })
             })
             .collect();
         cards.sort_by(|a, b| a.id.cmp(&b.id));
@@ -345,6 +354,7 @@ mod intel {
                 util,
                 // The clock reads 0 while the GPU sleeps.
                 core_mhz: read(&self.freq).map(|m| m as f32),
+                on_cpu_die: self.integrated,
                 ..Default::default()
             }
         }
@@ -392,6 +402,7 @@ mod intel {
             let g = cards[0].read_at(t0);
             assert_eq!((g.util, g.core_mhz), (None, Some(1250.0)), "first read is only the baseline");
             assert_eq!(cards[1].read_at(t0).core_mhz, Some(300.0));
+            assert!(g.on_cpu_die, "no hwmon: integrated");
 
             // 2 s later: idle for 1.5 s of them = awake 25 % of the time.
             fs::write(xe.join("gtidle/idle_residency_ms"), "11500\n").unwrap();

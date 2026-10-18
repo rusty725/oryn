@@ -509,6 +509,11 @@ impl App {
         if let Some(i) = self.table.selected() {
             self.table.select(if self.order.is_empty() { None } else { Some(i.min(self.order.len() - 1)) });
         }
+        // An integrated GPU has no sensor of its own; it sits on the CPU's chip.
+        let pkg = self.cpu_temp().map(|(_, t)| t);
+        for g in self.gpu.gpus.iter_mut().filter(|g| g.on_cpu_die) {
+            g.temp = pkg;
+        }
         // After the sensors are read, so RAM sticks can be listed.
         if self.show[P_SPECS] && !self.compact {
             self.collect_specs();
