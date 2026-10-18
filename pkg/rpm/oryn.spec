@@ -8,7 +8,7 @@
 %global _docdir_fmt %{name}
 
 Name:           oryn
-Version:        0.1.3
+Version:        0.1.4
 Release:        1%{?dist}
 Summary:        Terminal hardware monitor with every temperature sensor
 
@@ -57,6 +57,11 @@ install -Dm0644 doc/oryn.1 %{buildroot}%{_mandir}/man1/oryn.1
 %{_mandir}/man1/oryn.1*
 
 %changelog
+* Sat Oct 17 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.4-1
+- Specs: full SATA firmware revision.
+- Sensors: Wi-Fi cards named from pci.ids.
+- Header: version after the clock.
+
 * Sat Oct 17 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.3-1
 - Battery badge in the header on laptops, tablets and handhelds.
 - Integrated GPUs get their own iGPU badge in the header.
