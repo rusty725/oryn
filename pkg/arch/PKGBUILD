@@ -1,6 +1,6 @@
 # Maintainer: rusty725 <rusty725@users.noreply.github.com>
 pkgname=oryn
-pkgver=0.1.5
+pkgver=0.1.6
 pkgrel=1
 pkgdesc='Terminal hardware monitor: every temperature sensor plus btop-style CPU, GPU, memory, disk, network and process panels'
 arch=('x86_64' 'aarch64')
@@ -14,7 +14,7 @@ optdepends=(
   'hwdata: readable names for PCI devices (GPUs, network cards, USB controllers)'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# After pushing the v0.1.5 tag to GitHub, run `updpkgsums` to fill this in.
+# After pushing the v0.1.6 tag to GitHub, run `updpkgsums` to fill this in.
 sha256sums=('SKIP')
 
 prepare() {

@@ -8,7 +8,7 @@
 %global _docdir_fmt %{name}
 
 Name:           oryn
-Version:        0.1.5
+Version:        0.1.6
 Release:        1%{?dist}
 Summary:        Terminal hardware monitor with every temperature sensor
 
@@ -57,6 +57,10 @@ install -Dm0644 doc/oryn.1 %{buildroot}%{_mandir}/man1/oryn.1
 %{_mandir}/man1/oryn.1*
 
 %changelog
+* Sat Oct 17 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.6-1
+- Panel menu: clearer key hints (Ctrl+Shift+↑/↓ to move a panel).
+- Tests no longer overwrite the saved settings.
+
 * Sat Oct 17 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.5-1
 - Specs: RAM part numbers for soldered memory, from SMBIOS.
 - Sensors: Wi-Fi cards named from their thermal zone's driver.
