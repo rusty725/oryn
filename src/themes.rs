@@ -66,7 +66,9 @@ pub const THEMES: [Theme; 100] = [
         name: "Terminal",
         bg: Color::Reset,
         fg: Color::Reset,
-        dim: Color::DarkGray,
+        // A fixed grey from the 256-color range, not ANSI "bright black":
+        // some palettes (Solarized) make that the background color.
+        dim: Color::Indexed(244),
         border: Color::Reset,
         accent: Color::Cyan,
         sel_bg: Color::Rgb(40, 44, 52),
