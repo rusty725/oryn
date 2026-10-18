@@ -1,0 +1,217 @@
+# Build the release packages, install-test each one on the distros it is
+# for, and on a `v*` tag publish them as a GitHub Release.
+#
+# The .deb, .rpm and binary .tar.gz are built on Ubuntu 22.04 so the binary
+# only needs glibc 2.35 and runs on every current distribution; building on a
+# newer system would raise that floor. The Arch package is built in Arch with
+# Arch's default flags (generic x86-64, not -march/target-cpu=native).
+#
+# Run it by hand (Actions → release → Run workflow) to build and test without
+# publishing.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    steps:
+      - name: Tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential dpkg-dev rpm file
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+      - name: Version
+        id: v
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v$VER" ]; then
+            echo "tag ${GITHUB_REF_NAME} doesn't match Cargo.toml version $VER" >&2
+            exit 1
+          fi
+      - name: Test
+        run: cargo test --release --locked
+      - name: .deb
+        run: sh pkg/deb/build-deb.sh
+      - name: Binary .tar.gz
+        run: |
+          VER=${{ steps.v.outputs.ver }}
+          D=oryn-$VER-x86_64-linux
+          mkdir -p "dist/$D"
+          cp target/release/oryn doc/oryn.1 README.md LICENSE THIRD_PARTY_NOTICES.md LICENSES-dependencies.txt "dist/$D/"
+          tar -C dist --owner=0 --group=0 -czf "dist/$D.tar.gz" "$D"
+          cp target/deb/*.deb dist/
+      - name: .rpm
+        run: |
+          VER=${{ steps.v.outputs.ver }}
+          TOP=$PWD/target/rpmbuild
+          mkdir -p "$TOP/SOURCES"
+          git archive --prefix="oryn-$VER/" -o "$TOP/SOURCES/oryn-$VER.tar.gz" HEAD
+          # --nodeps: the BuildRequires name Fedora packages, not Ubuntu's.
+          rpmbuild -bb --nodeps --define "_topdir $TOP" --define "dist %{nil}" pkg/rpm/oryn.spec
+          cp "$TOP"/RPMS/x86_64/*.rpm dist/
+      - name: Check
+        run: |
+          echo "newest glibc symbol the binary needs:"
+          objdump -T target/release/oryn | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+          rpm -qpR dist/*.rpm
+          dpkg-deb -I dist/*.deb
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.tar.gz
+
+  build-arch:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Tools
+        run: |
+          pacman -Syu --noconfirm --needed git rust
+          useradd -m builder
+      - uses: actions/checkout@v4
+      - name: makepkg
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          VER=$(sed -n 's/^pkgver=//p' pkg/arch/PKGBUILD)
+          # The PKGBUILD downloads the tag's source; a file of that name
+          # already in place is used instead, so this also works before the
+          # tag exists.
+          git archive --prefix="oryn-$VER/" -o "pkg/arch/oryn-$VER.tar.gz" HEAD
+          chown -R builder pkg/arch
+          cd pkg/arch
+          sudo -u builder makepkg --noconfirm
+          mkdir -p ../../dist
+          cp oryn-$VER-*-x86_64.pkg.tar.zst ../../dist/
+          ls -l ../../dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: dist/oryn-*-x86_64.pkg.tar.zst
+
+  # Install, run and remove each package the way the README says.
+  test-deb:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['debian:12', 'debian:13', 'ubuntu:22.04', 'ubuntu:24.04']
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: linux }
+      - run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y ./oryn_*.deb
+          oryn --version
+          oryn --list || true
+          apt-get remove -y oryn
+          if command -v oryn; then echo "still installed" >&2; exit 1; fi
+
+  test-rpm:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: 'fedora:latest', install: 'dnf install -y ./oryn-*.rpm', remove: 'dnf remove -y oryn' }
+          - { image: 'rockylinux:9', install: 'dnf install -y ./oryn-*.rpm', remove: 'dnf remove -y oryn' }
+          - { image: 'opensuse/tumbleweed', install: 'zypper --non-interactive install --allow-unsigned-rpm ./oryn-*.rpm', remove: 'zypper --non-interactive remove oryn' }
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: linux }
+      - run: |
+          ${{ matrix.install }}
+          oryn --version
+          oryn --list || true
+          ${{ matrix.remove }}
+          if command -v oryn; then echo "still installed" >&2; exit 1; fi
+
+  test-arch:
+    needs: build-arch
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: arch }
+      - run: |
+          pacman -Syu --noconfirm
+          pacman -U --noconfirm ./oryn-*-x86_64.pkg.tar.zst
+          oryn --version
+          oryn --list || true
+          pacman -R --noconfirm oryn
+          if command -v oryn; then echo "still installed" >&2; exit 1; fi
+
+  test-tarball:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['debian:12', 'fedora:latest']
+    container: ${{ matrix.image }}
+    steps:
+      - name: tar
+        run: if command -v dnf; then dnf install -y tar gzip; fi
+      - uses: actions/download-artifact@v4
+        with: { name: linux }
+      - run: |
+          tar xzf oryn-*-x86_64-linux.tar.gz
+          cd oryn-*-x86_64-linux
+          install -Dm755 oryn /usr/local/bin/oryn
+          install -Dm644 oryn.1 /usr/local/share/man/man1/oryn.1
+          oryn --version
+          rm /usr/local/bin/oryn /usr/local/share/man/man1/oryn.1
+          if command -v oryn; then echo "still installed" >&2; exit 1; fi
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [test-deb, test-rpm, test-arch, test-tarball]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+          cat > notes.md <<EOF
+          | File | For |
+          |------|-----|
+          | \`$(ls *.pkg.tar.zst)\` | Arch Linux, CachyOS, EndeavourOS, Manjaro |
+          | \`$(ls *.deb)\` | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS |
+          | \`$(ls *.rpm)\` | Fedora, RHEL / Rocky / Alma 9+, openSUSE |
+          | \`$(ls *.tar.gz)\` | any x86_64 Linux with glibc 2.35+ (binary + man page) |
+          | \`SHA256SUMS\` | checksums: \`sha256sum -c --ignore-missing SHA256SUMS\` |
+
+          Installation and removal for each: see the [README](https://github.com/${{ github.repository }}#installation).
+          EOF
+          gh release create "$TAG" --repo "${{ github.repository }}" --title "Oryn ${TAG#v}" \
+            --notes-file notes.md --verify-tag \
+            *.pkg.tar.zst *.deb *.rpm *.tar.gz SHA256SUMS
