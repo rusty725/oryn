@@ -2,8 +2,8 @@
 # for, and on a `v*` tag publish them as a GitHub Release.
 #
 # The .deb, .rpm and binary .tar.gz are built on Ubuntu 22.04 so the binary
-# only needs glibc 2.35 and runs on every current distribution; building on a
-# newer system would raise that floor. The Arch package is built in Arch with
+# only needs glibc 2.34 (RHEL 9, Debian 12, Ubuntu 22.04 and newer); building
+# on a newer system would raise that floor. The Arch package is built in Arch with
 # Arch's default flags (generic x86-64, not -march/target-cpu=native).
 #
 # Run it by hand (Actions → release → Run workflow) to build and test without
@@ -207,7 +207,7 @@ jobs:
           | \`$(ls *.pkg.tar.zst)\` | Arch Linux, CachyOS, EndeavourOS, Manjaro |
           | \`$(ls *.deb)\` | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS |
           | \`$(ls *.rpm)\` | Fedora, RHEL / Rocky / Alma 9+, openSUSE |
-          | \`$(ls *.tar.gz)\` | any x86_64 Linux with glibc 2.35+ (binary + man page) |
+          | \`$(ls *.tar.gz)\` | any x86_64 Linux with glibc 2.34+ (binary + man page) |
           | \`SHA256SUMS\` | checksums: \`sha256sum -c --ignore-missing SHA256SUMS\` |
 
           Installation and removal for each: see the [README](https://github.com/${{ github.repository }}#installation).

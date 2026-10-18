@@ -69,25 +69,77 @@ you can show, hide and rearrange.
 
 ## Installation
 
-### Arch Linux: prebuilt package
+Every [release](https://github.com/rusty725/oryn/releases/latest) has
+ready-made packages for x86_64 (64-bit Intel/AMD). On other machines
+(aarch64…), [build from source](#any-linux-distribution-from-source).
 
-Download `oryn-0.1.0-1-x86_64.pkg.tar.zst` from the
-[Releases](https://github.com/rusty725/oryn/releases) page, then:
+| Package | For |
+|---------|-----|
+| `oryn-0.1.0-1-x86_64.pkg.tar.zst` | Arch Linux, CachyOS, EndeavourOS, Manjaro |
+| `oryn_0.1.0-1_amd64.deb` | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS |
+| `oryn-0.1.0-1.x86_64.rpm` | Fedora, RHEL / Rocky / Alma 9+, openSUSE |
+| `oryn-0.1.0-x86_64-linux.tar.gz` | any other x86_64 Linux with glibc 2.34+ |
+
+Each package installs the `oryn` command and its man page (`man oryn`).
+The commands below download the file into the current folder and install
+it. To check a download first, get `SHA256SUMS` from the same release and
+run `sha256sum -c --ignore-missing SHA256SUMS`.
+
+### Arch Linux, CachyOS, Manjaro
 
 ```sh
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.0/oryn-0.1.0-1-x86_64.pkg.tar.zst
 sudo pacman -U oryn-0.1.0-1-x86_64.pkg.tar.zst
-sudo pacman -S --asdeps smartmontools hwdata   # optional extras
+sudo pacman -S --needed --asdeps smartmontools hwdata   # optional extras
 ```
 
-### Arch Linux: build the package yourself
-
-The [PKGBUILD](pkg/arch/PKGBUILD) downloads the release source, builds it,
-runs the tests and installs it:
+Or build the package yourself: the [PKGBUILD](pkg/arch/PKGBUILD) downloads
+the release source, builds it, runs the tests and installs it.
 
 ```sh
 git clone https://github.com/rusty725/oryn.git
 cd oryn/pkg/arch
 makepkg -si
+```
+
+### Debian, Ubuntu, Linux Mint, Pop!_OS
+
+```sh
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.0/oryn_0.1.0-1_amd64.deb
+sudo apt install ./oryn_0.1.0-1_amd64.deb
+sudo apt install smartmontools          # optional extra
+```
+
+The `./` matters: without it `apt` looks for a package called that name
+in its repositories instead of the file.
+
+### Fedora, RHEL, Rocky, AlmaLinux
+
+```sh
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.0/oryn-0.1.0-1.x86_64.rpm
+sudo dnf install ./oryn-0.1.0-1.x86_64.rpm
+```
+
+`dnf` also installs the recommended `smartmontools` and `hwdata`.
+
+### openSUSE
+
+```sh
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.0/oryn-0.1.0-1.x86_64.rpm
+sudo zypper install --allow-unsigned-rpm ./oryn-0.1.0-1.x86_64.rpm
+```
+
+### Any other Linux: the .tar.gz
+
+A plain binary plus the man page, for distributions without a package
+above. Needs glibc 2.34 or newer (`ldd --version` shows yours).
+
+```sh
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.0/oryn-0.1.0-x86_64-linux.tar.gz
+tar xzf oryn-0.1.0-x86_64-linux.tar.gz
+cd oryn-0.1.0-x86_64-linux
+sudo install -Dm755 oryn /usr/local/bin/oryn
+sudo install -Dm644 oryn.1 /usr/local/share/man/man1/oryn.1
 ```
 
 ### Any Linux distribution: from source
@@ -105,13 +157,25 @@ Or let Cargo fetch and build it into `~/.cargo/bin`:
 cargo install --locked --git https://github.com/rusty725/oryn
 ```
 
-### Uninstall
+## Uninstall
+
+Remove it the same way it was installed:
+
+| Installed with | Remove with |
+|----------------|-------------|
+| Arch package (`pacman -U` or `makepkg -si`) | `sudo pacman -R oryn` |
+| `.deb` | `sudo apt remove oryn` |
+| `.rpm` on Fedora / RHEL | `sudo dnf remove oryn` |
+| `.rpm` on openSUSE | `sudo zypper remove oryn` |
+| `.tar.gz` | `sudo rm /usr/local/bin/oryn /usr/local/share/man/man1/oryn.1` |
+| from source | `sudo rm /usr/local/bin/oryn` |
+| `cargo install` | `cargo uninstall oryn` |
+
+Packages don't touch your settings. To remove those too:
 
 ```sh
-sudo pacman -R oryn                  # Arch package
-sudo rm /usr/local/bin/oryn          # installed from source
-cargo uninstall oryn                 # installed with cargo install
-rm -r ~/.config/oryn                 # saved settings, if you want them gone too
+rm -r ~/.config/oryn
+sudo rm -f /etc/sudoers.d/oryn-smartctl   # only if you added the smartctl rule below
 ```
 
 ## After installing
