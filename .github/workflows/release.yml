@@ -31,7 +31,7 @@ jobs:
             ca-certificates curl git build-essential dpkg-dev rpm file
           curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Version
         id: v
         run: |
@@ -70,7 +70,7 @@ jobs:
           rpm -qpR dist/*.rpm
           dpkg-deb -I dist/*.deb
           ls -l dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: |
@@ -86,7 +86,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed git rust
           useradd -m builder
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: makepkg
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -101,7 +101,7 @@ jobs:
           mkdir -p ../../dist
           cp oryn-$VER-*-x86_64.pkg.tar.zst ../../dist/
           ls -l ../../dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: arch
           path: dist/oryn-*-x86_64.pkg.tar.zst
@@ -116,7 +116,7 @@ jobs:
         image: ['debian:12', 'debian:13', 'ubuntu:22.04', 'ubuntu:24.04']
     container: ${{ matrix.image }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: linux }
       - run: |
           apt-get update
@@ -138,7 +138,7 @@ jobs:
           - { image: 'opensuse/tumbleweed', install: 'zypper --non-interactive install --allow-unsigned-rpm ./oryn-*.rpm', remove: 'zypper --non-interactive remove oryn' }
     container: ${{ matrix.image }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: linux }
       - run: |
           ${{ matrix.install }}
@@ -152,7 +152,7 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: arch }
       - run: |
           pacman -Syu --noconfirm
@@ -173,7 +173,7 @@ jobs:
     steps:
       - name: tar
         run: if command -v dnf; then dnf install -y tar gzip; fi
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { name: linux }
       - run: |
           tar xzf oryn-*-x86_64-linux.tar.gz
@@ -191,7 +191,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { path: dist, merge-multiple: true }
       - name: Publish
         env:
