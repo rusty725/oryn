@@ -1,0 +1,38 @@
+Oryn on FreeBSD: after installing
+=================================
+
+Required: nothing beyond the base system. Everything below is optional and
+adds readings.
+
+1. CPU temperatures: load the sensor driver (AMD: amdtemp, Intel: coretemp)
+
+     sudo kldload amdtemp                  # or: coretemp
+     sudo sysrc kld_list+="amdtemp"        # keep it after reboot
+
+2. CPU power (watts), RAM temperatures and part numbers: two more kernel
+   modules (read as root)
+
+     sudo kldload cpuctl smb
+     sudo sysrc kld_list+="cpuctl smb"
+
+3. Optional packages
+
+     sudo pkg install smartmontools        # SATA/NVMe SMART temperatures
+     sudo pkg install dmidecode            # RAM model and speed without root
+     sudo pkg install nvidia-driver        # NVIDIA GPU panel (nvidia-smi)
+
+4. Run it
+
+     oryn              # everything readable as a normal user
+     sudo oryn         # adds SMART, CPU watts, RAM, NVMe health and
+                       # NVIDIA hotspot / VRAM temperatures
+
+   Optional: let a normal `oryn` use smartctl and dmidecode without a
+   password (Oryn only ever runs them with `sudo -n`, never asks):
+
+     echo "$USER ALL=(root) NOPASSWD: /usr/local/sbin/smartctl, /usr/local/sbin/dmidecode" \
+       | sudo tee /usr/local/etc/sudoers.d/oryn
+     sudo chmod 440 /usr/local/etc/sudoers.d/oryn
+
+Check what was found:  oryn --list
+Manual:                man oryn

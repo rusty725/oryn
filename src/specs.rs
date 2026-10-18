@@ -44,7 +44,15 @@ fn human_size(bytes: f64) -> String {
 impl Specs {
     /// `gpus` from the GPU panel; `dimms`: RAM stick names from the sensors;
     /// `cpu_name` from sysinfo.
-    pub fn collect(cpu_name: &str, threads: usize, mem_total: u64, gpus: &[GpuSpec], dimms: &[String]) -> Self {
+    /// `ram_speed`: "DDR5 · 6000 MT/s" from SMBIOS, when readable.
+    pub fn collect(
+        cpu_name: &str,
+        threads: usize,
+        mem_total: u64,
+        gpus: &[GpuSpec],
+        dimms: &[String],
+        ram_speed: Option<&str>,
+    ) -> Self {
         use sysinfo::System;
         let r = root();
         let mut lines = Vec::new();
@@ -55,32 +63,68 @@ impl Specs {
         };
 
         // OS / host.
-        let os = System::long_os_version().or_else(System::name).unwrap_or_default();
+        // On FreeBSD sysinfo's long version is all of kern.version (build
+        // path, newline) and its kernel version is __FreeBSD_version.
+        #[cfg(target_os = "freebsd")]
+        let (os, kernel) = {
+            use crate::freebsd::sysctl_str;
+            let release = sysctl_str("kern.osrelease").unwrap_or_default();
+            let os = format!("{} {release}", sysctl_str("kern.ostype").unwrap_or_else(|| "FreeBSD".into()));
+            let kernel = [Some(release), sysctl_str("kern.ident")].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+            (os, kernel)
+        };
+        #[cfg(not(target_os = "freebsd"))]
+        let (os, kernel) = (
+            System::long_os_version().or_else(System::name).unwrap_or_default(),
+            System::kernel_version().unwrap_or_default(),
+        );
         add("OS", "", format!("{os} {}", System::cpu_arch()).trim().to_string());
-        add("Kernel", "", System::kernel_version().unwrap_or_default());
+        add("Kernel", "", kernel);
         add("Host", "", System::host_name().unwrap_or_default());
         add("Uptime", "", "live".into()); // value replaced live by the panel
 
         // Motherboard / BIOS (readable without root).
+        // FreeBSD: the loader puts the same SMBIOS strings in kenv.
+        #[cfg(target_os = "freebsd")]
+        let dmi_get = |linux: &str, kenv: &str| {
+            let _ = linux;
+            crate::freebsd::kenv(&format!("smbios.{kenv}"))
+        };
+        #[cfg(not(target_os = "freebsd"))]
         let dmi = r.join("sys/class/dmi/id");
-        let board = [read(&dmi.join("board_vendor")), read(&dmi.join("board_name"))]
+        #[cfg(not(target_os = "freebsd"))]
+        let dmi_get = |linux: &str, kenv: &str| {
+            let _ = kenv;
+            read(&dmi.join(linux))
+        };
+        let board = [dmi_get("board_vendor", "planar.maker"), dmi_get("board_name", "planar.product")]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
             .join(" ");
         add("Board", "MB", board);
-        let bios = [read(&dmi.join("bios_vendor")), read(&dmi.join("bios_version")), read(&dmi.join("bios_date"))]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" · ");
+        let bios = [
+            dmi_get("bios_vendor", "bios.vendor"),
+            dmi_get("bios_version", "bios.version"),
+            dmi_get("bios_date", "bios.reldate"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
         add("BIOS", "MB", bios);
 
         // CPU.
-        let cores = System::physical_core_count();
-        let max_mhz = read(&r.join("sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"))
-            .and_then(|k| k.parse::<f64>().ok())
-            .map(|k| k / 1000.0);
+        #[cfg(target_os = "freebsd")]
+        let (cores, max_mhz) =
+            (crate::freebsd::physical_cores(), crate::freebsd::max_mhz().map(|m| m as f64));
+        #[cfg(not(target_os = "freebsd"))]
+        let (cores, max_mhz) = (
+            System::physical_core_count(),
+            read(&r.join("sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"))
+                .and_then(|k| k.parse::<f64>().ok())
+                .map(|k| k / 1000.0),
+        );
         let mut cpu = cpu_name.to_string();
         if let Some(c) = cores {
             cpu.push_str(&format!(" · {c} cores / {threads} threads"));
@@ -135,6 +179,9 @@ impl Specs {
                 .collect();
             ram.push_str(&format!(" · {}", sticks.join(", ")));
         }
+        if let Some(s) = ram_speed {
+            ram.push_str(&format!(" · {s}"));
+        }
         add("RAM", "RAM", ram);
 
         // Drives: model, size, type.
@@ -174,13 +221,26 @@ impl Specs {
                 Some((model, sectors * 512.0, kind, firmware))
             })
             .collect();
+        #[cfg(target_os = "freebsd")]
+        drives.extend(crate::freebsd::disks().into_iter().map(|g| {
+            let kind = match (g.name.starts_with("nda") || g.name.starts_with("nvd"), g.rotational) {
+                (true, _) => "NVME",
+                (_, Some(true)) => "HDD",
+                _ => "SSD",
+            };
+            (g.model.unwrap_or(g.name), g.bytes as f64, kind, None)
+        }));
         drives.sort_by(|a, b| a.2.cmp(b.2).then(a.0.cmp(&b.0)));
         for (model, bytes, kind, firmware) in drives {
             let fw = firmware.map(|f| format!(" · firmware {f}")).unwrap_or_default();
             add("Disk", kind, format!("{model} · {} {}{fw}", human_size(bytes), kind_word(kind)));
         }
 
-        for n in nets(&r) {
+        #[cfg(target_os = "freebsd")]
+        let adapters = crate::freebsd::nics();
+        #[cfg(not(target_os = "freebsd"))]
+        let adapters = nets(&r);
+        for n in adapters {
             add("Net", "NET", n);
         }
 
@@ -196,6 +256,7 @@ impl Specs {
 
 /// Network adapters (not virtual ones), sorted: "enp8s0 · Realtek RTL8126
 /// 5GbE Controller · r8169 driver · 5 Gb/s", plus the state when not up.
+#[cfg(not(target_os = "freebsd"))]
 fn nets(root: &Path) -> Vec<String> {
     #[cfg(target_os = "linux")]
     let mut namer = crate::devnames::Namer::new(root);

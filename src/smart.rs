@@ -33,6 +33,9 @@ struct Disk {
     path: String,
     /// smartctl device type from --scan, e.g. "sat", "nvme", "scsi".
     kind: Option<String>,
+    /// Name to show when it isn't the path's last part (FreeBSD: "nda0"
+    /// for the controller /dev/nvme0).
+    name: Option<String>,
     model: Option<String>,
     rotational: Option<bool>,
     temp: Option<f32>,
@@ -42,7 +45,7 @@ struct Disk {
 
 impl Disk {
     fn new(path: String, kind: Option<String>) -> Self {
-        Self { path, kind, model: None, rotational: None, temp: None, critical: None, note: Some("…".into()) }
+        Self { path, kind, name: None, model: None, rotational: None, temp: None, critical: None, note: Some("…".into()) }
     }
 }
 
@@ -99,6 +102,12 @@ impl SmartPoller {
                 .filter(|(p, _)| !skip.contains(p))
                 // On Linux NVMe drives already come from the nvme hwmon driver.
                 .filter(|(p, _)| !(cfg!(target_os = "linux") && p.starts_with("/dev/nvme")))
+                // On FreeBSD (as root) the scan lists each NVMe drive twice:
+                // the controller, which smartctl can read, and its nda/nvd
+                // disk, which it can't.
+                .filter(|(p, _)| {
+                    !(cfg!(target_os = "freebsd") && (p.starts_with("/dev/nda") || p.starts_with("/dev/nvd")))
+                })
                 .map(|(p, k)| Disk::new(p, k))
                 .collect()
         } else {
@@ -123,6 +132,44 @@ impl SmartPoller {
                     d.model = model;
                     d.rotational = rot;
                     d.note = Some("modprobe drivetemp".into());
+                    disks.push(d);
+                }
+            }
+        }
+
+        #[cfg(target_os = "freebsd")]
+        {
+            // Without root `smartctl --scan` finds nothing (it opens
+            // /dev/pass*), so list the drives from GEOM, which also has
+            // model and rotation rate. smartctl wants the NVMe controller
+            // ("/dev/nvme0") rather than the nda disk.
+            for g in crate::freebsd::disks() {
+                let (path, kind) = if g.name.starts_with("nda") || g.name.starts_with("nvd") {
+                    match crate::freebsd::nvme_controller(&g.name) {
+                        Some(c) => (format!("/dev/{c}"), Some("nvme".to_string())),
+                        None => continue,
+                    }
+                } else if g.name.starts_with("ada") {
+                    (format!("/dev/{}", g.name), Some("atacam".to_string()))
+                } else {
+                    (format!("/dev/{}", g.name), None)
+                };
+                if skip.contains(&path) {
+                    continue;
+                }
+                let name = (!path.ends_with(&g.name)).then(|| g.name.clone());
+                if let Some(d) = disks.iter_mut().find(|d| d.path == path) {
+                    d.name = name;
+                    d.model = d.model.take().or(g.model);
+                    d.rotational = d.rotational.or(g.rotational);
+                } else {
+                    let mut d = Disk::new(path, kind);
+                    d.name = name;
+                    d.model = g.model;
+                    d.rotational = g.rotational;
+                    if !have_smartctl {
+                        d.note = Some("pkg install smartmontools".into());
+                    }
                     disks.push(d);
                 }
             }
@@ -166,7 +213,7 @@ impl SmartPoller {
             .unwrap()
             .iter()
             .map(|d| {
-                let short = d.path.rsplit('/').next().unwrap_or(&d.path).to_string();
+                let short = d.name.clone().unwrap_or_else(|| d.path.rsplit('/').next().unwrap_or(&d.path).to_string());
                 // Typical maximum operating temperature: 60 °C for hard drives,
                 // 70 °C for SSDs, unless the drive reports its own limit.
                 let default_crit = if d.rotational == Some(false) { 70.0 } else { 60.0 };

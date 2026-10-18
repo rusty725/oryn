@@ -158,13 +158,18 @@ impl SysStats {
             .cpus()
             .first()
             .map(|c| c.brand().trim().to_string())
-            .filter(|b| !b.is_empty())
-            .unwrap_or_else(|| "CPU".into());
+            .filter(|b| !b.is_empty());
+        // sysinfo has no brand string on FreeBSD; hw.model does.
+        #[cfg(target_os = "freebsd")]
+        let cpu_name = cpu_name.or_else(crate::freebsd::cpu_model);
+        let cpu_name = cpu_name.unwrap_or_else(|| "CPU".into());
+        let disks_src = {
+            let _guard = libc_buffers();
+            Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage().with_io_usage())
+        };
         let mut s = Self {
             sys,
-            disks_src: Disks::new_with_refreshed_list_specifics(
-                DiskRefreshKind::nothing().with_storage().with_io_usage(),
-            ),
+            disks_src,
             nets_src: Networks::new_with_refreshed_list(),
             users: Users::new_with_refreshed_list(),
             user_names: HashMap::new(),
@@ -262,6 +267,7 @@ impl SysStats {
 
         if want.disks {
             let dt = since(&mut self.last_disks);
+            let _guard = libc_buffers();
             self.disks_src.refresh_specifics(
                 true,
                 DiskRefreshKind::nothing().with_storage().with_io_usage(),
@@ -275,6 +281,12 @@ impl SysStats {
                 // repeat the same device.
                 .filter(|d| seen.insert(d.name().to_os_string()))
                 .filter(|d| d.total_space() > 0)
+                // FreeBSD reports pseudo filesystems (fdescfs under
+                // /compat/linux, procfs…) with a nominal size.
+                .filter(|d| {
+                    let fs = d.file_system().to_string_lossy();
+                    !["devfs", "fdescfs", "procfs", "linprocfs", "linsysfs"].contains(&fs.as_ref())
+                })
                 .map(|d| {
                     let mount = d.mount_point().to_string_lossy().to_string();
                     let label = if mount == "/" {
@@ -399,6 +411,7 @@ impl SysStats {
                 .with_memory()
                 .with_cmd(UpdateKind::OnlyIfNotSet)
                 .with_user(UpdateKind::OnlyIfNotSet);
+            let _guard = libc_buffers();
             self.sys.refresh_processes_specifics(
                 ProcessesToUpdate::All,
                 true,
@@ -526,6 +539,26 @@ fn linux_core_freqs(root: &std::path::Path) -> Vec<u64> {
     cpus.iter().filter_map(|c| khz(c.join("cpufreq/scaling_cur_freq"))).map(|k| k / 1000).collect()
 }
 
+/// On FreeBSD, sysinfo's disk and process lists come from getmntinfo(3) and
+/// kvm_getargv(3), which return buffers shared by the whole process, so two
+/// refreshes at once (e.g. parallel tests) crash. Hold this around them.
+/// Elsewhere it's a no-op.
+fn libc_buffers() -> impl Drop {
+    #[cfg(target_os = "freebsd")]
+    {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        struct NoLock;
+        impl Drop for NoLock {
+            fn drop(&mut self) {}
+        }
+        NoLock
+    }
+}
+
 fn sort_procs(list: &mut [ProcInfo], by: ProcSort) {
     match by {
         ProcSort::Cpu => list.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(b.mem.cmp(&a.mem))),
@@ -560,7 +593,11 @@ fn cached_bytes() -> Option<u64> {
         };
         Some(get("Cached:")? + get("SReclaimable:").unwrap_or(0))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "freebsd")]
+    {
+        crate::freebsd::cached_bytes()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
         None
     }
@@ -667,7 +704,11 @@ pub fn cpu_topology(n: usize) -> Vec<CpuTopo> {
             })
             .collect()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "freebsd")]
+    {
+        crate::freebsd::topology(n)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
         vec![CpuTopo::default(); n]
     }

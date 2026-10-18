@@ -34,9 +34,13 @@ use ratatui::{
     },
     DefaultTerminal, Frame,
 };
-#[cfg(target_os = "linux")]
+// FreeBSD uses only its SPD decoding (for DDR5 names read over SMBus).
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg_attr(target_os = "freebsd", allow(dead_code))]
 mod devnames;
 mod battery;
+#[cfg(target_os = "freebsd")]
+mod freebsd;
 mod gpu;
 
 /// Developer/test overrides: `ORYN_<KEY>` (or the pre-rename `TEMPMON_<KEY>`),
@@ -55,7 +59,7 @@ mod memprobe;
 // system allocator unchanged.
 #[global_allocator]
 static ALLOC: memprobe::Counting = memprobe::Counting;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod nvapi;
 mod panels;
 mod power;
@@ -884,19 +888,32 @@ impl App {
         if self.specs.as_ref().is_some_and(|(_, n)| *n == gpus.len()) {
             return;
         }
+        // A "kldload smb" / "needs root" hint row (device just "RAM") isn't a stick.
         #[allow(unused_mut)]
-        let mut dimms: Vec<String> =
-            self.sensors.iter().filter(|s| s.kind == "RAM").map(|s| s.device.clone()).collect();
-        // No stick named from its SPD chip (soldered memory has none, or no
-        // root): the BIOS's own list of modules, if readable.
+        let mut dimms: Vec<String> = self
+            .sensors
+            .iter()
+            .filter(|s| s.kind == "RAM" && s.device != "RAM")
+            .map(|s| s.device.clone())
+            .collect();
+        // The BIOS's own list of modules (SMBIOS type 17), if readable: the
+        // speed, and the names when no stick was named from its SPD chip
+        // (soldered memory has none, or no root).
         #[cfg(target_os = "linux")]
-        if dimms.iter().all(|d| d.starts_with("RAM DIMM")) {
+        let dmi = {
             let root = crate::env_os("SYSFS").unwrap_or_else(|| "/".into());
-            let dmi = devnames::dmi_memory(std::path::Path::new(&root));
-            if !dmi.is_empty() {
-                dimms = dmi;
-            }
+            devnames::dmi_memory(std::path::Path::new(&root))
+        };
+        #[cfg(target_os = "freebsd")]
+        let dmi = freebsd::dmi_memory();
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if dimms.iter().all(|d| d.starts_with("RAM DIMM")) && !dmi.sticks.is_empty() {
+            dimms = dmi.sticks.clone();
         }
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        let ram_speed = dmi.speed;
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        let ram_speed: Option<String> = None;
         let sys = sysinfo::System::new_with_specifics(
             sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()),
         );
@@ -906,6 +923,7 @@ impl App {
             sys.total_memory(),
             &gpus,
             &dimms,
+            ram_speed.as_deref(),
         );
         self.specs = Some((s, gpus.len()));
     }
@@ -983,7 +1001,7 @@ fn main() -> io::Result<()> {
         );
         return Ok(());
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     if args.iter().any(|a| a == "--no-nvapi") {
         nvapi::disable();
     }
@@ -1153,7 +1171,18 @@ fn real_source(interval: Duration) -> Option<Box<dyn Source>> {
         let empty = src.is_empty();
         (Box::new(src) as Box<dyn Source>, empty, disks)
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "freebsd")]
+    let (base, base_empty, disks) = {
+        let src = freebsd::SysctlSource::new();
+        // NVMe drives the controller lets us read directly skip SMART.
+        let nvme = freebsd::NvmeSource::new();
+        let disks = smart::SmartPoller::new(&nvme.paths());
+        let empty = src.is_empty() && nvme.is_empty();
+        let ram = freebsd::RamSource::new();
+        let base = sensors::Combined { base: Box::new(src), extras: vec![Box::new(nvme), Box::new(ram)] };
+        (Box::new(base) as Box<dyn Source>, empty, disks)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     let (base, base_empty, disks) = {
         let src = sensors::SysinfoSource::new();
         let disks = smart::SmartPoller::new(&Default::default());

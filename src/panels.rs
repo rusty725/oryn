@@ -956,8 +956,13 @@ fn draw_one_gpu(f: &mut Frame, area: Rect, g: &crate::gpustats::GpuView, show_na
     if let Some(mhz) = g.mem_mhz {
         add("Mem", format!("{mhz:.0} MHz"), v);
     }
-    // When NVIDIA's VRAM/hotspot aren't readable, say where to find out why.
-    if g.nvidia && (g.vram_temp.is_none() || g.hotspot.is_none()) && g.hotspot_note != Some("needs root") {
+    // When NVIDIA's VRAM/hotspot aren't readable, say where to find out why
+    // (Linux only: elsewhere there's no NvAPI to explain).
+    if cfg!(target_os = "linux")
+        && g.nvidia
+        && (g.vram_temp.is_none() || g.hotspot.is_none())
+        && g.hotspot_note != Some("needs root")
+    {
         parts.push(Span::styled("   (why —? oryn --gpu-info)", d));
     }
     f.render_widget(Paragraph::new(Line::from(parts)), stats);

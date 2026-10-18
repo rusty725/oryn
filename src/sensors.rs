@@ -53,6 +53,7 @@ impl Source for Combined {
 }
 
 /// Chip / zone names that mean "this is the CPU".
+#[cfg_attr(target_os = "freebsd", allow(dead_code))]
 pub fn is_cpu_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     matches!(
@@ -62,6 +63,7 @@ pub fn is_cpu_name(name: &str) -> bool {
     ) || n.starts_with("cpu")
 }
 
+#[cfg_attr(target_os = "freebsd", allow(dead_code))]
 fn clean_crit(c: Option<f32>) -> Option<f32> {
     c.filter(|c| c.is_finite() && *c > 0.0 && *c < 250.0)
 }
@@ -336,12 +338,12 @@ pub mod linux {
 // Other OSes: sysinfo
 // ---------------------------------------------------------------------------
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 pub struct SysinfoSource {
     components: sysinfo::Components,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 impl SysinfoSource {
     pub fn new() -> Self {
         Self { components: sysinfo::Components::new_with_refreshed_list() }
@@ -351,7 +353,7 @@ impl SysinfoSource {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 impl Source for SysinfoSource {
     fn read(&mut self) -> Vec<Reading> {
         self.components.refresh(true);

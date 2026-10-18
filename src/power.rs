@@ -20,9 +20,41 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 struct Zone {
-    energy: PathBuf,
+    energy: Counter,
     /// The counter wraps around after this many microjoules.
     max_range: u64,
+}
+
+/// Where a zone's energy counter (microjoules) is read from.
+enum Counter {
+    /// Linux powercap `energy_uj`.
+    File(PathBuf),
+    /// FreeBSD: the RAPL MSR itself, through cpuctl(4).
+    #[cfg(target_os = "freebsd")]
+    Msr(crate::freebsd::EnergyMsr),
+}
+
+impl Zone {
+    fn read(&self) -> std::io::Result<u64> {
+        match &self.energy {
+            Counter::File(p) => read_u64(p),
+            #[cfg(target_os = "freebsd")]
+            Counter::Msr(m) => m.read_uj(),
+        }
+    }
+
+    fn max_range(&self) -> u64 {
+        match &self.energy {
+            Counter::File(_) => self.max_range,
+            #[cfg(target_os = "freebsd")]
+            Counter::Msr(m) => m.max_range(),
+        }
+    }
+
+    #[cfg(target_os = "freebsd")]
+    fn msr(dram: bool) -> Option<Self> {
+        crate::freebsd::EnergyMsr::new(dram).map(|m| Zone { energy: Counter::Msr(m), max_range: u64::MAX })
+    }
 }
 
 pub struct PowerMeter {
@@ -62,7 +94,7 @@ fn rapl_zones(root: &Path, want: impl Fn(&str, bool) -> bool) -> Vec<Zone> {
                 return None;
             }
             let max_range = read_u64(&dir.join("max_energy_range_uj")).unwrap_or(u64::MAX);
-            Some((dir_name, Zone { energy: dir.join("energy_uj"), max_range }))
+            Some((dir_name, Zone { energy: Counter::File(dir.join("energy_uj")), max_range }))
         })
         .collect();
     zones.sort_by(|a, b| a.0.cmp(&b.0));
@@ -74,7 +106,12 @@ impl PowerMeter {
     pub fn cpu(root: &Path) -> Self {
         // Top-level package zones only: not "psys" (the whole platform) and
         // not their parts, which the package already includes.
-        let zones = rapl_zones(root, |name, top| top && name.starts_with("package"));
+        #[allow(unused_mut)]
+        let mut zones = rapl_zones(root, |name, top| top && name.starts_with("package"));
+        #[cfg(target_os = "freebsd")]
+        if root == Path::new("/") {
+            zones.extend(Zone::msr(false));
+        }
 
         // zenpower: power1_input (cores) + power2_input (SoC), in microwatts.
         let hwmon = fs::read_dir(root.join("sys/class/hwmon"))
@@ -91,7 +128,12 @@ impl PowerMeter {
 
     /// Memory, from the "dram" zones (one per package, wherever they sit).
     pub fn dram(root: &Path) -> Self {
-        let zones = rapl_zones(root, |name, _| name == "dram");
+        #[allow(unused_mut)]
+        let mut zones = rapl_zones(root, |name, _| name == "dram");
+        #[cfg(target_os = "freebsd")]
+        if root == Path::new("/") {
+            zones.extend(Zone::msr(true));
+        }
         Self { zones, last: None, hwmon: Vec::new(), watts: None, note: None }
     }
 
@@ -105,13 +147,18 @@ impl PowerMeter {
         if !self.zones.is_empty() {
             let mut values = Vec::with_capacity(self.zones.len());
             for z in &self.zones {
-                match read_u64(&z.energy) {
+                match z.read() {
                     Ok(v) => values.push(v),
                     Err(e) => {
                         self.last = None;
                         self.watts = None;
                         if e.kind() == std::io::ErrorKind::PermissionDenied {
                             self.note = Some("needs root");
+                        }
+                        // FreeBSD: /dev/cpuctl0 only exists with the module loaded.
+                        #[cfg(target_os = "freebsd")]
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            self.note = Some("kldload cpuctl");
                         }
                         return self.refresh_hwmon();
                     }
@@ -124,7 +171,7 @@ impl PowerMeter {
                         .iter()
                         .zip(prev)
                         .zip(&self.zones)
-                        .map(|((&new, &old), z)| if new >= old { new - old } else { new + z.max_range.saturating_sub(old) })
+                        .map(|((&new, &old), z)| if new >= old { new - old } else { new + z.max_range().saturating_sub(old) })
                         .sum();
                     let w = uj as f64 / 1e6 / dt;
                     // A counter reset can produce nonsense; no CPU draws 2 kW.

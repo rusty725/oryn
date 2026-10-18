@@ -39,8 +39,16 @@ you can show, hide and rearrange.
 
 **To run it**
 
-- **Linux** (x86_64 or aarch64). Oryn contains code for macOS and Windows
-  too, but it hasn't been built or tested there yet.
+- **Linux** (x86_64 or aarch64), or **FreeBSD** 15 (amd64). Oryn contains
+  code for macOS and Windows too, but it hasn't been built or tested there yet.
+- **On FreeBSD:** CPU temperatures need `kldload amdtemp` (AMD) or
+  `kldload coretemp` (Intel); add it to `kld_list` in `/etc/rc.conf` to make
+  it permanent. Drive temperatures need `smartmontools` and root (or a
+  sudoers rule for `/usr/local/sbin/smartctl`). NVIDIA GPUs work with the
+  `nvidia-driver` package; their hotspot and VRAM temperatures (RTX 30
+  GDDR6X and newer) are read from the GPU's registers through a read-only
+  mapping of BAR0, which needs root (`--no-nvapi` turns it off). Build
+  with `pkg install rust` or rustup.
 - A terminal with UTF-8, 80×24 or larger (150 columns or wider for the
   two-column layout). 24-bit color is recommended.
 - **Sensor drivers.** Most distributions load these automatically:
@@ -82,6 +90,8 @@ ready-made packages for x86_64 (64-bit Intel/AMD). On other machines
 | `oryn_0.1.7-1_amd64.deb` | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS |
 | `oryn-0.1.7-1.x86_64.rpm` | Fedora, RHEL / Rocky / Alma 9+, openSUSE |
 | `oryn-0.1.7-x86_64-linux.tar.gz` | any other x86_64 Linux with glibc 2.34+ |
+| `oryn-0.1.7-freebsd-amd64.pkg` | FreeBSD 15 (amd64), installed with `pkg` |
+| `oryn-0.1.7-amd64-freebsd.tar.gz` | FreeBSD 15 (amd64): binary, man page and instructions |
 
 Each package installs the `oryn` command and its man page (`man oryn`).
 The commands below download the file into the current folder and install
@@ -160,6 +170,73 @@ Or let Cargo fetch and build it into `~/.cargo/bin`:
 cargo install --locked --git https://github.com/rusty725/oryn
 ```
 
+### FreeBSD
+
+Built on FreeBSD 15.1-RELEASE (amd64). With the package:
+
+```sh
+fetch https://github.com/rusty725/oryn/releases/download/v0.1.7/oryn-0.1.7-freebsd-amd64.pkg
+sudo pkg add ./oryn-0.1.7-freebsd-amd64.pkg
+```
+
+Or with the .tar.gz:
+
+```sh
+fetch https://github.com/rusty725/oryn/releases/download/v0.1.7/oryn-0.1.7-amd64-freebsd.tar.gz
+tar xzf oryn-0.1.7-amd64-freebsd.tar.gz
+cd oryn-0.1.7-amd64-freebsd
+sudo install -m 755 oryn /usr/local/bin/oryn
+sudo install -m 644 oryn.1 /usr/local/share/man/man1/oryn.1
+```
+
+To check a download, get `SHA256SUMS-freebsd` from the same release and
+compare it with `sha256 -r <file>`. Or build from source
+(`pkg install rust git`, then the [steps above](#any-linux-distribution-from-source),
+with `sudo install -m 755` in place of `install -Dm755`), or
+`sh pkg/freebsd/build-pkg.sh` to make both files yourself.
+
+**Dependencies.** Oryn only needs libraries from the FreeBSD base system
+(libc, libthr, libm, libkvm, libprocstat, libgeom, libdevstat, libgcc_s),
+so the package installs nothing else. These are optional and add readings:
+
+| Optional | What it adds | How |
+|----------|--------------|-----|
+| `amdtemp` / `coretemp` kernel module | CPU temperatures (AMD / Intel) | `kldload amdtemp` |
+| `cpuctl` kernel module | CPU power draw in watts (root) | `kldload cpuctl` |
+| `smb` kernel module | DDR5 RAM temperatures and part numbers (root) | `kldload smb` |
+| `smartmontools` package | SATA drive temperatures, SMART data | `pkg install smartmontools` |
+| `dmidecode` package | RAM model and speed without root (with a sudoers rule) | `pkg install dmidecode` |
+| `nvidia-driver` package | NVIDIA GPU panel (`nvidia-smi`) | `pkg install nvidia-driver` |
+
+NVMe temperatures, the drive list, board and BIOS details need nothing
+extra (NVMe health needs root).
+
+**After installing on FreeBSD** (`pkg info -D oryn` shows the same steps):
+
+```sh
+# 1. CPU sensor driver: amdtemp for AMD, coretemp for Intel
+sudo kldload amdtemp
+# 2. CPU watts and RAM sensors
+sudo kldload cpuctl smb
+# keep all three after reboot
+sudo sysrc kld_list+="amdtemp cpuctl smb"
+# 3. optional packages
+sudo pkg install smartmontools dmidecode
+# 4. run: as a normal user, or with sudo for SMART, CPU watts, RAM,
+#    NVMe health and NVIDIA hotspot / VRAM temperatures
+oryn
+sudo oryn
+```
+
+To let a normal `oryn` use `smartctl` and `dmidecode` without a password
+(Oryn only ever runs them as `sudo -n`, so it never prompts):
+
+```sh
+echo "$USER ALL=(root) NOPASSWD: /usr/local/sbin/smartctl, /usr/local/sbin/dmidecode" \
+  | sudo tee /usr/local/etc/sudoers.d/oryn
+sudo chmod 440 /usr/local/etc/sudoers.d/oryn
+```
+
 ## Uninstall
 
 Remove it the same way it was installed:
@@ -173,12 +250,15 @@ Remove it the same way it was installed:
 | `.tar.gz` | `sudo rm /usr/local/bin/oryn /usr/local/share/man/man1/oryn.1` |
 | from source | `sudo rm /usr/local/bin/oryn` |
 | `cargo install` | `cargo uninstall oryn` |
+| FreeBSD `.pkg` | `sudo pkg delete oryn` |
+| FreeBSD `.tar.gz` | `sudo rm /usr/local/bin/oryn /usr/local/share/man/man1/oryn.1` |
 
 Packages don't touch your settings. To remove those too:
 
 ```sh
 rm -r ~/.config/oryn
 sudo rm -f /etc/sudoers.d/oryn-smartctl   # only if you added the smartctl rule below
+sudo rm -f /usr/local/etc/sudoers.d/oryn  # FreeBSD, only if you added that rule
 ```
 
 ## After installing

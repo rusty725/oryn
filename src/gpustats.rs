@@ -57,6 +57,10 @@ pub struct GpuStats {
     /// NvAPI, loaded on first use when an NVIDIA GPU is present.
     #[cfg(target_os = "linux")]
     nvapi: Option<Result<crate::nvapi::NvApi, String>>,
+    /// NVIDIA's registers through BAR0 (FreeBSD has no NvAPI), mapped on
+    /// first use.
+    #[cfg(target_os = "freebsd")]
+    nv_regs: Option<crate::freebsd::NvRegs>,
     #[cfg(target_os = "linux")]
     amd: Option<Vec<amd::Card>>,
     #[cfg(target_os = "linux")]
@@ -140,6 +144,25 @@ impl GpuStats {
             let cards = self.intel.get_or_insert_with(|| intel::find(std::path::Path::new(&root)));
             for c in cards.iter_mut() {
                 list.push((format!("intel:{}", c.id), c.read()));
+            }
+        }
+
+        #[cfg(target_os = "freebsd")]
+        if !list.is_empty() && !crate::nvapi::disabled() {
+            let regs = self.nv_regs.get_or_insert_with(crate::freebsd::NvRegs::open);
+            for (key, g) in list.iter_mut() {
+                let Some(bus) = crate::nvapi::bus_number(key.trim_start_matches("nv:")) else { continue };
+                match regs.read(bus) {
+                    Some(t) => {
+                        g.hotspot = t.hotspot;
+                        g.hotspot_note = t.hotspot_note;
+                        if g.vram_temp.is_none() {
+                            g.vram_temp = t.vram;
+                        }
+                        g.vram_chips = t.vram_chips;
+                    }
+                    None => g.hotspot_note = regs.note,
+                }
             }
         }
 

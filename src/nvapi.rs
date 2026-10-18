@@ -18,6 +18,9 @@
 //! MIT license); see THIRD_PARTY_NOTICES.md for both notices. Only reads are
 //! performed. Everything is optional: if the library or a call is missing or
 //! fails, the reading is simply absent, and `--no-nvapi` turns it off.
+//!
+//! The register decoding (`read_registers`) works on any `Regs`; FreeBSD,
+//! which has no NvAPI, reads the same registers from a mapping of BAR0.
 
 #![allow(unsafe_op_in_unsafe_fn, dead_code)]
 
@@ -128,13 +131,7 @@ struct Gpu {
     mask: i32,
     hotspot_ch: Option<usize>,
     vram_ch: Option<usize>,
-    /// RTX 50 (Blackwell), from the chip-id register; None until first read.
-    blackwell: Option<bool>,
-    /// Where its RTX 50 hotspot comes from; None until first read.
-    hotspot: Option<HotspotSource>,
-    /// Its GDDR6X/GDDR7 chips (label, data register, which byte); None until
-    /// first read.
-    chips: Option<Vec<Chip>>,
+    regs: RegState,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -219,9 +216,7 @@ impl NvApi {
                     mask: 0,
                     hotspot_ch: None,
                     vram_ch: None,
-                    blackwell: None,
-                    hotspot: None,
-                    chips: None,
+                    regs: RegState::default(),
                 };
                 // Which channels exist and which are the hotspot / memory ones.
                 let mut info = ThermChannelInfo {
@@ -249,179 +244,33 @@ impl NvApi {
         Ok(api)
     }
 
-    /// Temperatures for the GPU on PCI bus `bus`. `blackwell` (a guess from
-    /// the PCI id) is used only if the chip-id register can't be read;
-    /// `gddr_regs` enables per-chip GDDR6X/GDDR7 readings.
     pub fn read(&mut self, bus: u32, blackwell: bool, gddr_regs: bool) -> Temps {
         let Some(i) = self.gpus.iter().position(|g| g.bus == bus) else {
             return Temps { error: Some(format!("NvAPI has no GPU on bus {bus:#x}")), ..Default::default() };
         };
         let mut t = Temps::default();
-        unsafe {
-            let (handle, mask, hot_ch, vram_ch) = {
-                let g = &self.gpus[i];
-                (g.handle, g.mask, g.hotspot_ch, g.vram_ch)
-            };
-            if mask != 0 {
-                let mut th = Thermals { version: version::<Thermals>(2), mask, rsvd: [0; 32], temps: [0; 32] };
-                match self.gpu_query(handle, &mut th, Q_THERM_CHANNEL_GET_STATUS) {
-                    Ok(()) => {
-                        let get = |c: Option<usize>| {
-                            let v = th.temps.get(c?)? / 256;
-                            (v > 0 && v < 255).then_some(v as f32)
-                        };
-                        t.hotspot = get(hot_ch);
-                        t.vram = get(vram_ch);
-                    }
-                    Err(e) => t.error = Some(e),
+        let (handle, mask, hot_ch, vram_ch) = {
+            let g = &self.gpus[i];
+            (g.handle, g.mask, g.hotspot_ch, g.vram_ch)
+        };
+        if mask != 0 {
+            let mut th = Thermals { version: version::<Thermals>(2), mask, rsvd: [0; 32], temps: [0; 32] };
+            match unsafe { self.gpu_query(handle, &mut th, Q_THERM_CHANNEL_GET_STATUS) } {
+                Ok(()) => {
+                    let get = |c: Option<usize>| {
+                        let v = th.temps.get(c?)? / 256;
+                        (v > 0 && v < 255).then_some(v as f32)
+                    };
+                    t.hotspot = get(hot_ch);
+                    t.vram = get(vram_ch);
                 }
-            }
-            // RTX 50 has no hotspot channel. The chip-id register (readable
-            // by anyone) tells; the PCI-id guess is the fallback. Once.
-            if self.gpus[i].blackwell.is_none() {
-                let chip = match self.read_reg(handle, REG_PMC_BOOT_0) {
-                    Ok(boot0) if boot0 != 0 && boot0 != u32::MAX as u64 => is_blackwell_chip(boot0 as u32),
-                    _ => blackwell,
-                };
-                self.gpus[i].blackwell = Some(chip);
-            }
-            // On RTX 50 the sensor window is the real hotspot (as in LACT);
-            // keep a channel value only if the window yields nothing.
-            if self.gpus[i].blackwell == Some(true) {
-                if self.gpus[i].hotspot.is_none() {
-                    let found = self.find_hotspot(handle);
-                    self.gpus[i].hotspot = Some(found);
-                }
-                match self.gpus[i].hotspot.clone() {
-                    Some(HotspotSource::Window(offsets)) => match self.read_regs(handle, &offsets) {
-                        Ok(words) => {
-                            if let Some(v) = words.iter().filter_map(|w| therm_temp(*w as u32)).reduce(f32::max) {
-                                t.hotspot = Some(v);
-                            }
-                        }
-                        Err(e) => t.error = Some(e),
-                    },
-                    Some(HotspotSource::Single) => match self.read_reg(handle, REG_BLACKWELL_HOTSPOT) {
-                        Ok(raw) => {
-                            let v = (raw & 0xFFFF) as f32 / 256.0;
-                            if (1.0..=THERM_TEMP_MAX).contains(&v) {
-                                t.hotspot = Some(v);
-                            }
-                        }
-                        Err(e) => t.error = Some(e),
-                    },
-                    Some(HotspotSource::Refused) if t.hotspot.is_none() => {
-                        // The driver only lets root read the NV_THERM block.
-                        t.hotspot_note = Some(if is_root() { "read failed" } else { "needs root" });
-                        t.error = Some("hotspot registers refused (they need root)".into());
-                    }
-                    Some(HotspotSource::Nothing) if t.hotspot.is_none() => t.hotspot_note = Some("no sensor"),
-                    _ => {}
-                }
-            }
-            if gddr_regs {
-                if self.gpus[i].chips.is_none() {
-                    let chips = self.find_chips(handle);
-                    self.gpus[i].chips = Some(chips);
-                }
-                let chips = self.gpus[i].chips.clone().unwrap_or_default();
-                if !chips.is_empty() {
-                    // Chips can share a register (front and back on clamshell
-                    // boards): read each register once, in one call.
-                    let mut regs: Vec<u32> = chips.iter().map(|c| c.register).collect();
-                    regs.dedup();
-                    if let Ok(words) = self.read_regs(handle, &regs) {
-                        let decode = |raw: u64| (2 * raw.min(0x50)) as f32 - 40.0;
-                        for c in &chips {
-                            let Some(w) = regs.iter().position(|r| *r == c.register).map(|k| words[k]) else { continue };
-                            let byte = (w >> c.shift) & 0xFF;
-                            if byte != 0 && byte != 0xFF {
-                                t.vram_chips.push((c.label.clone(), decode(byte)));
-                            }
-                        }
-                    }
-                }
-                if t.vram.is_none() {
-                    t.vram = t.vram_chips.iter().map(|c| c.1).reduce(f32::max);
-                }
+                Err(e) => t.error = Some(e),
             }
         }
+        let mut state = std::mem::take(&mut self.gpus[i].regs);
+        read_registers(&ApiRegs { api: self, handle }, &mut state, blackwell, gddr_regs, &mut t);
+        self.gpus[i].regs = state;
         t
-    }
-
-    /// Where an RTX 50's hotspot can be read, worked out once: the registers
-    /// in the NV_THERM sensor window that carry the 0x4000 temperature tag
-    /// (which slots are populated differs between Blackwell models), else
-    /// LACT's single aggregated register. Scan bounds and decoding from
-    /// nvidia-gpu-sensors (MIT, Philip Langdale).
-    unsafe fn find_hotspot(&self, handle: Handle) -> HotspotSource {
-        let offsets: Vec<u32> = (THERM_SCAN_FIRST..=THERM_SCAN_LAST).step_by(4).collect();
-        match self.read_regs(handle, &offsets) {
-            Err(_) => HotspotSource::Refused,
-            Ok(words) => {
-                let tagged: Vec<u32> = offsets
-                    .iter()
-                    .zip(&words)
-                    .filter(|(_, w)| therm_temp(**w as u32).is_some())
-                    .map(|(o, _)| *o)
-                    .collect();
-                if !tagged.is_empty() {
-                    return HotspotSource::Window(tagged);
-                }
-                match self.read_reg(handle, REG_BLACKWELL_HOTSPOT) {
-                    Ok(raw) if (1.0..=THERM_TEMP_MAX).contains(&((raw & 0xFFFF) as f32 / 256.0)) => HotspotSource::Single,
-                    _ => HotspotSource::Nothing,
-                }
-            }
-        }
-    }
-
-    /// The GDDR6X/GDDR7 chips on this card and the registers that report
-    /// them, worked out once. Labelled like LACT: partition letter + chip
-    /// index ("A0", "B1"…), with " F"/" B" for the front/back chip on
-    /// clamshell boards.
-    unsafe fn find_chips(&self, handle: Handle) -> Vec<Chip> {
-        let clamshell = self.read_reg(handle, REG_GDDR_CLAMSHELL).is_ok_and(|v| (v >> 22) & 1 == 1);
-        let mut out = Vec::new();
-        for partition in 0..=8u32 {
-            let data_base = REG_GDDR_TEMP_DATA_BASE + partition * 0x4000;
-            let Ok(status) = self.read_reg(handle, REG_GDDR_TEMP_STATUS_BASE + partition * 0x4000) else {
-                continue;
-            };
-            if status & 0xFFFF0000 == 0xBADF0000 {
-                continue; // unpopulated partition
-            }
-            let letter = (b'A' + partition as u8) as char;
-            let mut i = 0;
-            for pair in [[(0x0, 24), (0x8, 26)], [(0x4, 25), (0xC, 27)]] {
-                for (slot, bit) in pair {
-                    if (status >> bit) & 1 != 1 {
-                        continue;
-                    }
-                    let register = data_base + slot;
-                    let Ok(data) = self.read_reg(handle, register) else { continue };
-                    if data == 0 || data == u32::MAX as u64 || data & 0xFFFF0000 == 0xBADF0000 {
-                        continue;
-                    }
-                    let (front, back) = ((data >> 16) & 0xFF, (data >> 24) & 0xFF);
-                    if front == 0 || front == 0xFF {
-                        continue;
-                    }
-                    let label = format!("{letter}{i}");
-                    if clamshell {
-                        out.push(Chip { label: format!("{label} F"), register, shift: 16 });
-                        if back != 0 && back != 0xFF {
-                            out.push(Chip { label: format!("{label} B"), register, shift: 24 });
-                        }
-                    } else {
-                        out.push(Chip { label, register, shift: 16 });
-                    }
-                    i += 1;
-                    break;
-                }
-            }
-        }
-        out
     }
 
     /// Several 32-bit register reads in one driver call.
@@ -510,6 +359,187 @@ impl Drop for NvApi {
     }
 }
 
+/// 32-bit reads of GPU registers (offsets into BAR0): through NvAPI's
+/// register op on Linux, through a /dev/mem mapping of BAR0 on FreeBSD.
+pub trait Regs {
+    fn read_regs(&self, offsets: &[u32]) -> Result<Vec<u64>, String>;
+    fn read_reg(&self, offset: u32) -> Result<u64, String> {
+        self.read_regs(&[offset]).map(|v| v[0])
+    }
+}
+
+/// NvAPI's register op for one GPU.
+struct ApiRegs<'a> {
+    api: &'a NvApi,
+    handle: Handle,
+}
+
+impl Regs for ApiRegs<'_> {
+    fn read_regs(&self, offsets: &[u32]) -> Result<Vec<u64>, String> {
+        unsafe { self.api.read_regs(self.handle, offsets) }
+    }
+    fn read_reg(&self, offset: u32) -> Result<u64, String> {
+        unsafe { self.api.read_reg(self.handle, offset) }
+    }
+}
+
+/// What the registers taught us about one GPU on the first read, which
+/// can't change while Oryn runs (chip type, hotspot slots, memory layout).
+#[derive(Default)]
+pub struct RegState {
+    /// RTX 50 (Blackwell), from the chip-id register; None until first read.
+    blackwell: Option<bool>,
+    /// Where its RTX 50 hotspot comes from; None until first read.
+    hotspot: Option<HotspotSource>,
+    /// Its GDDR6X/GDDR7 chips (label, data register, which byte); None until
+    /// first read.
+    chips: Option<Vec<Chip>>,
+}
+
+/// The register-based readings into `t`: the RTX 50 hotspot and the
+/// GDDR6X/GDDR7 chip temperatures. `blackwell` (a guess from the PCI id) is
+/// used only if the chip-id register can't be read; `gddr_regs` enables
+/// per-chip readings.
+pub fn read_registers(r: &dyn Regs, st: &mut RegState, blackwell: bool, gddr_regs: bool, t: &mut Temps) {
+    // RTX 50 has no hotspot channel. The chip-id register (readable by
+    // anyone) tells; the PCI-id guess is the fallback. Once.
+    if st.blackwell.is_none() {
+        let chip = match r.read_reg(REG_PMC_BOOT_0) {
+            Ok(boot0) if boot0 != 0 && boot0 != u32::MAX as u64 => is_blackwell_chip(boot0 as u32),
+            _ => blackwell,
+        };
+        st.blackwell = Some(chip);
+    }
+    // On RTX 50 the sensor window is the real hotspot (as in LACT); keep a
+    // channel value only if the window yields nothing.
+    if st.blackwell == Some(true) {
+        let source = st.hotspot.get_or_insert_with(|| find_hotspot(r)).clone();
+        match source {
+            HotspotSource::Window(offsets) => match r.read_regs(&offsets) {
+                Ok(words) => {
+                    if let Some(v) = words.iter().filter_map(|w| therm_temp(*w as u32)).reduce(f32::max) {
+                        t.hotspot = Some(v);
+                    }
+                }
+                Err(e) => t.error = Some(e),
+            },
+            HotspotSource::Single => match r.read_reg(REG_BLACKWELL_HOTSPOT) {
+                Ok(raw) => {
+                    let v = (raw & 0xFFFF) as f32 / 256.0;
+                    if (1.0..=THERM_TEMP_MAX).contains(&v) {
+                        t.hotspot = Some(v);
+                    }
+                }
+                Err(e) => t.error = Some(e),
+            },
+            HotspotSource::Refused if t.hotspot.is_none() => {
+                // The driver only lets root read the NV_THERM block.
+                t.hotspot_note = Some(if is_root() { "read failed" } else { "needs root" });
+                t.error = Some("hotspot registers refused (they need root)".into());
+            }
+            HotspotSource::Nothing if t.hotspot.is_none() => t.hotspot_note = Some("no sensor"),
+            _ => {}
+        }
+    }
+    if gddr_regs {
+        let chips = st.chips.get_or_insert_with(|| find_chips(r));
+        if !chips.is_empty() {
+            // Chips can share a register (front and back on clamshell
+            // boards): read each register once, in one call.
+            let mut regs: Vec<u32> = chips.iter().map(|c| c.register).collect();
+            regs.dedup();
+            if let Ok(words) = r.read_regs(&regs) {
+                let decode = |raw: u64| (2 * raw.min(0x50)) as f32 - 40.0;
+                for c in chips.iter() {
+                    let Some(w) = regs.iter().position(|r| *r == c.register).map(|k| words[k]) else { continue };
+                    let byte = (w >> c.shift) & 0xFF;
+                    if byte != 0 && byte != 0xFF {
+                        t.vram_chips.push((c.label.clone(), decode(byte)));
+                    }
+                }
+            }
+        }
+        if t.vram.is_none() {
+            t.vram = t.vram_chips.iter().map(|c| c.1).reduce(f32::max);
+        }
+    }
+}
+
+/// Where an RTX 50's hotspot can be read, worked out once: the registers
+/// in the NV_THERM sensor window that carry the 0x4000 temperature tag
+/// (which slots are populated differs between Blackwell models), else
+/// LACT's single aggregated register. Scan bounds and decoding from
+/// nvidia-gpu-sensors (MIT, Philip Langdale).
+fn find_hotspot(r: &dyn Regs) -> HotspotSource {
+    let offsets: Vec<u32> = (THERM_SCAN_FIRST..=THERM_SCAN_LAST).step_by(4).collect();
+    match r.read_regs(&offsets) {
+        Err(_) => HotspotSource::Refused,
+        Ok(words) => {
+            let tagged: Vec<u32> = offsets
+                .iter()
+                .zip(&words)
+                .filter(|(_, w)| therm_temp(**w as u32).is_some())
+                .map(|(o, _)| *o)
+                .collect();
+            if !tagged.is_empty() {
+                return HotspotSource::Window(tagged);
+            }
+            match r.read_reg(REG_BLACKWELL_HOTSPOT) {
+                Ok(raw) if (1.0..=THERM_TEMP_MAX).contains(&((raw & 0xFFFF) as f32 / 256.0)) => HotspotSource::Single,
+                _ => HotspotSource::Nothing,
+            }
+        }
+    }
+}
+
+/// The GDDR6X/GDDR7 chips on this card and the registers that report
+/// them, worked out once. Labelled like LACT: partition letter + chip
+/// index ("A0", "B1"…), with " F"/" B" for the front/back chip on
+/// clamshell boards.
+fn find_chips(r: &dyn Regs) -> Vec<Chip> {
+    let clamshell = r.read_reg(REG_GDDR_CLAMSHELL).is_ok_and(|v| (v >> 22) & 1 == 1);
+    let mut out = Vec::new();
+    for partition in 0..=8u32 {
+        let data_base = REG_GDDR_TEMP_DATA_BASE + partition * 0x4000;
+        let Ok(status) = r.read_reg(REG_GDDR_TEMP_STATUS_BASE + partition * 0x4000) else {
+            continue;
+        };
+        if status & 0xFFFF0000 == 0xBADF0000 {
+            continue; // unpopulated partition
+        }
+        let letter = (b'A' + partition as u8) as char;
+        let mut i = 0;
+        for pair in [[(0x0, 24), (0x8, 26)], [(0x4, 25), (0xC, 27)]] {
+            for (slot, bit) in pair {
+                if (status >> bit) & 1 != 1 {
+                    continue;
+                }
+                let register = data_base + slot;
+                let Ok(data) = r.read_reg(register) else { continue };
+                if data == 0 || data == u32::MAX as u64 || data & 0xFFFF0000 == 0xBADF0000 {
+                    continue;
+                }
+                let (front, back) = ((data >> 16) & 0xFF, (data >> 24) & 0xFF);
+                if front == 0 || front == 0xFF {
+                    continue;
+                }
+                let label = format!("{letter}{i}");
+                if clamshell {
+                    out.push(Chip { label: format!("{label} F"), register, shift: 16 });
+                    if back != 0 && back != 0xFF {
+                        out.push(Chip { label: format!("{label} B"), register, shift: 24 });
+                    }
+                } else {
+                    out.push(Chip { label, register, shift: 16 });
+                }
+                i += 1;
+                break;
+            }
+        }
+    }
+    out
+}
+
 static DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `--no-nvapi`: never load the library.
@@ -546,10 +576,8 @@ fn therm_temp(w: u32) -> Option<f32> {
 }
 
 pub fn is_root() -> bool {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| s.lines().find(|l| l.starts_with("Uid:")).map(|l| l.split_whitespace().nth(2) == Some("0")))
-        .unwrap_or(false)
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() == 0 }
 }
 
 /// RTX 50 / Blackwell consumer chips (GB20x) use PCI device IDs 0x2b00–0x2fff.

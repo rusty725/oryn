@@ -297,7 +297,7 @@ fn spd_eeprom(dev: &Path) -> Option<Vec<u8>> {
     })
 }
 
-fn parse_spd(b: &[u8]) -> Option<String> {
+pub fn parse_spd(b: &[u8]) -> Option<String> {
     // Byte 2 is the DRAM type. Offsets come from JEDEC SPD specs.
     let (mfr_at, part) = match b.get(2)? {
         0x12 | 0x13 if b.len() >= 551 => (512, &b[521..551]), // DDR5 / LPDDR5
@@ -323,7 +323,7 @@ fn parse_spd(b: &[u8]) -> Option<String> {
 /// `/sys/firmware/dmi/entries/17-*/raw`): "Samsung K3KL8L80CM-MGCT". This
 /// covers soldered memory (most laptops), which has no SPD chip to read.
 /// The entries are readable by root only; without root this is empty.
-pub fn dmi_memory(root: &Path) -> Vec<String> {
+pub fn dmi_memory(root: &Path) -> DmiRam {
     let mut entries: Vec<PathBuf> = fs::read_dir(root.join("sys/firmware/dmi/entries"))
         .into_iter()
         .flatten()
@@ -332,7 +332,67 @@ pub fn dmi_memory(root: &Path) -> Vec<String> {
         .map(|e| e.path().join("raw"))
         .collect();
     entries.sort();
-    entries.iter().filter_map(|p| fs::read(p).ok()).filter_map(|b| parse_dmi_memory(&b)).collect()
+    let raw: Vec<Vec<u8>> = entries.iter().filter_map(|p| fs::read(p).ok()).collect();
+    dmi_ram(&raw)
+}
+
+/// The installed memory as SMBIOS describes it.
+#[derive(Default)]
+pub struct DmiRam {
+    /// One name per populated slot: "Kingston KF560C36BBE-32".
+    pub sticks: Vec<String>,
+    /// "DDR5 · 6000 MT/s", or "DDR5 · 4800 MT/s (rated 6000)".
+    pub speed: Option<String>,
+}
+
+/// Names and speed from raw SMBIOS type 17 entries (formatted area plus strings).
+pub fn dmi_ram(entries: &[Vec<u8>]) -> DmiRam {
+    DmiRam {
+        sticks: entries.iter().filter_map(|b| parse_dmi_memory(b)).collect(),
+        speed: entries
+            .iter()
+            .filter_map(|b| parse_dmi_speed(b))
+            .find_map(|(kind, configured, rated)| ram_speed_text(kind, configured, rated)),
+    }
+}
+
+/// (memory type, configured speed, rated speed) of a populated type 17 entry.
+/// Speeds are MT/s; 0xFFFF means "see the 32-bit extended field".
+fn parse_dmi_speed(b: &[u8]) -> Option<(Option<&'static str>, Option<u32>, Option<u32>)> {
+    let len = *b.get(1)? as usize;
+    if *b.first()? != 17 || len < 0x17 || b.len() < len || u16::from_le_bytes([b[0x0C], b[0x0D]]) == 0 {
+        return None;
+    }
+    let word = |off: usize| (len >= off + 2).then(|| u16::from_le_bytes([b[off], b[off + 1]]) as u32);
+    let dword = |off: usize| (len >= off + 4).then(|| u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]));
+    let speed = |short: usize, ext: usize| match word(short) {
+        Some(0xFFFF) => dword(ext),
+        w => w,
+    }
+    .filter(|s| *s > 0);
+    let kind = match b[0x12] {
+        0x18 => Some("DDR3"),
+        0x1A => Some("DDR4"),
+        0x1D => Some("LPDDR3"),
+        0x1E => Some("LPDDR4"),
+        0x22 => Some("DDR5"),
+        0x23 => Some("LPDDR5"),
+        _ => None,
+    };
+    Some((kind, speed(0x20, 0x58), speed(0x15, 0x54)))
+}
+
+/// "DDR5 · 6000 MT/s"; the rated speed is added when the memory runs slower.
+pub fn ram_speed_text(kind: Option<&str>, configured: Option<u32>, rated: Option<u32>) -> Option<String> {
+    let mts = match (configured.or(rated), rated) {
+        (Some(c), Some(r)) if c < r => format!("{c} MT/s (rated {r})"),
+        (Some(c), _) => format!("{c} MT/s"),
+        (None, _) => return kind.map(str::to_string),
+    };
+    Some(match kind {
+        Some(k) => format!("{k} · {mts}"),
+        None => mts,
+    })
 }
 
 fn parse_dmi_memory(b: &[u8]) -> Option<String> {
@@ -349,13 +409,22 @@ fn parse_dmi_memory(b: &[u8]) -> Option<String> {
     }
     let strings: Vec<&[u8]> = b[len..].split(|&c| c == 0).take_while(|s| !s.is_empty()).collect();
     let string = |n: u8| -> Option<String> {
-        let s = String::from_utf8_lossy(strings.get((n as usize).checked_sub(1)?)?).trim().to_string();
+        Some(String::from_utf8_lossy(strings.get((n as usize).checked_sub(1)?)?).to_string())
+    };
+    dmi_stick_name(string(b[0x17]).as_deref(), string(b[0x1A]).as_deref())
+}
+
+/// "Kingston KF560C36BBE-32" from SMBIOS's manufacturer and part number
+/// strings, ignoring the placeholders BIOSes fill empty fields with.
+pub fn dmi_stick_name(maker: Option<&str>, part: Option<&str>) -> Option<String> {
+    let clean = |s: Option<&str>| -> Option<String> {
+        let s = s?.trim().to_string();
         let junk = ["", "Unknown", "Not Specified", "NO DIMM", "Undefined", "0000", "00000000"];
         (!junk.iter().any(|j| s.eq_ignore_ascii_case(j)) && !s.starts_with("Manufacturer") && !s.starts_with("PartNum"))
             .then_some(s)
     };
-    let part = string(b[0x1A]);
-    let maker = string(b[0x17]).map(|m| dmi_maker(&m));
+    let part = clean(part);
+    let maker = clean(maker).map(|m| dmi_maker(&m));
     match (maker, part) {
         (Some(m), Some(p)) if !p.to_ascii_lowercase().starts_with(&m.to_ascii_lowercase()) => Some(format!("{m} {p}")),
         (_, Some(p)) => Some(p),
@@ -532,8 +601,8 @@ mod tests {
             fs::create_dir_all(&d).unwrap();
             fs::write(d.join("raw"), entry(size, "Micron", "MT62F1G32D4DR-031")).unwrap();
         }
-        assert_eq!(dmi_memory(&tmp), ["Micron MT62F1G32D4DR-031", "Micron MT62F1G32D4DR-031"]);
-        assert!(dmi_memory(&tmp.join("nothing")).is_empty());
+        assert_eq!(dmi_memory(&tmp).sticks, ["Micron MT62F1G32D4DR-031", "Micron MT62F1G32D4DR-031"]);
+        assert!(dmi_memory(&tmp.join("nothing")).sticks.is_empty());
         let _ = fs::remove_dir_all(&tmp);
     }
 

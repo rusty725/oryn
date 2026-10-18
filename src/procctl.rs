@@ -75,7 +75,7 @@ pub fn renice(pid: u32, nice: i32) -> Result<(), String> {
     #[cfg(unix)]
     {
         // SAFETY: plain syscall.
-        let r = unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice) };
+        let r = unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as _, nice) };
         if r == 0 { Ok(()) } else { Err(errno_message("renice")) }
     }
     #[cfg(not(unix))]
@@ -120,7 +120,17 @@ pub fn nice_of(pid: u32) -> Option<i32> {
         let rest = stat.get(stat.rfind(')')? + 2..)?;
         rest.split_whitespace().nth(16)?.parse().ok()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "freebsd")]
+    {
+        // getpriority(2) can legitimately return -1, so errno tells failure apart.
+        // SAFETY: plain syscalls on this thread's errno.
+        unsafe {
+            *libc::__error() = 0;
+            let n = libc::getpriority(libc::PRIO_PROCESS, pid as _);
+            (*libc::__error() == 0).then_some(n)
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
         let _ = pid;
         None
@@ -214,10 +224,10 @@ mod tests {
         // A real child process: start, read and change its nice, stop it.
         let pid = exec("sleep 30").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         assert_eq!(nice_of(pid), Some(0));
         renice(pid, 10).unwrap();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         assert_eq!(nice_of(pid), Some(10));
         assert!(renice(pid, 25).is_err());
         signal(pid, Sig::Term).unwrap();
