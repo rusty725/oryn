@@ -23,8 +23,9 @@ you can show, hide and rearrange.
   each core's usage, live clock speed, power draw in watts, load and a usage
   graph.
 - **GPU:** NVIDIA (temperature, hotspot, per-chip VRAM temperatures on GDDR6X
-  and GDDR7 cards, usage, VRAM, power, fan, clocks) and AMD Radeon (edge,
-  junction, memory temperature and the same load figures).
+  and GDDR7 cards, usage, VRAM, power, fan, clocks), AMD Radeon (edge,
+  junction, memory temperature and the same load figures) and Intel (`xe` or
+  `i915`: clock speed, and usage as the share of time the GPU was awake).
 - **Drives:** SATA through the `drivetemp` driver, everything else through
   SMART. Sleeping hard drives are never woken up just to read them.
 - **Processes:** btop-like list with search, start, terminate, kill and nice.

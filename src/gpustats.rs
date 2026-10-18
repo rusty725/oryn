@@ -4,6 +4,7 @@
 //!   (see gpu.rs), so no extra process is started.
 //! * AMD: straight from sysfs (`/sys/class/drm/cardN/device`): gpu_busy_percent,
 //!   mem_info_vram_*, and the card's hwmon for power, fan, clocks, temperature.
+//! * Intel: clock and awake time from the `xe` / `i915` sysfs files (see `intel`).
 
 use std::collections::{HashMap, VecDeque};
 
@@ -52,6 +53,8 @@ pub struct GpuStats {
     nvapi: Option<Result<crate::nvapi::NvApi, String>>,
     #[cfg(target_os = "linux")]
     amd: Option<Vec<amd::Card>>,
+    #[cfg(target_os = "linux")]
+    intel: Option<Vec<intel::Card>>,
 }
 
 impl GpuStats {
@@ -124,6 +127,11 @@ impl GpuStats {
             let cards = self.amd.get_or_insert_with(amd::find);
             for c in cards.iter() {
                 list.push((format!("amd:{}", c.id), c.read()));
+            }
+            let root = crate::env_os("SYSFS").unwrap_or_else(|| "/".into());
+            let cards = self.intel.get_or_insert_with(|| intel::find(std::path::Path::new(&root)));
+            for c in cards.iter_mut() {
+                list.push((format!("intel:{}", c.id), c.read()));
             }
         }
 
@@ -245,6 +253,157 @@ mod amd {
                 mem_mhz: h("freq2_input").map(|hz| (hz / 1e6) as f32),
                 hist: Default::default(),
             }
+        }
+    }
+}
+
+/// Intel GPUs (`xe` or `i915` driver): name, clock and how busy it is.
+///
+/// Neither driver reports a usage percentage in sysfs; the exact figure needs
+/// root (the perf PMU, as intel_gpu_top uses). What any user can read is how
+/// long the GPU has spent powered down in its idle state (RC6 / C6), so usage
+/// is shown as the share of time it was awake. Integrated GPUs have no
+/// temperature sensor or VRAM of their own, so those stay n/a.
+#[cfg(target_os = "linux")]
+mod intel {
+    use super::GpuView;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::Instant;
+
+    pub struct Card {
+        pub id: String,
+        name: String,
+        /// Current clock in MHz.
+        freq: PathBuf,
+        /// Milliseconds spent idle since boot.
+        idle: PathBuf,
+        last: Option<(u64, Instant)>,
+    }
+
+    fn read(p: &Path) -> Option<u64> {
+        fs::read_to_string(p).ok()?.trim().parse::<u64>().ok()
+    }
+
+    /// DRM cards whose PCI vendor is 0x8086 and that have a clock to read.
+    pub fn find(root: &Path) -> Vec<Card> {
+        let mut cards: Vec<Card> = fs::read_dir(root.join("sys/class/drm"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                // "card0", not "card0-eDP-1" (connectors).
+                let n = name.strip_prefix("card")?;
+                if n.is_empty() || !n.chars().all(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                let card = e.path();
+                let dev = card.join("device");
+                if fs::read_to_string(dev.join("vendor")).ok()?.trim() != "0x8086" {
+                    return None;
+                }
+                // xe: device/tile0/gt0/{freq0,gtidle}/. i915: gt_act_freq_mhz
+                // next to the card, RC6 residency under gt/gt0 (older: power/).
+                let gt = dev.join("tile0/gt0");
+                let (freq, idle) = if gt.join("freq0/act_freq").exists() {
+                    (gt.join("freq0/act_freq"), gt.join("gtidle/idle_residency_ms"))
+                } else if card.join("gt_act_freq_mhz").exists() {
+                    let rc6 = card.join("gt/gt0/rc6_residency_ms");
+                    (card.join("gt_act_freq_mhz"), if rc6.exists() { rc6 } else { card.join("power/rc6_residency_ms") })
+                } else {
+                    return None;
+                };
+                let display = crate::devnames::Namer::new(root).pci_name(&dev).unwrap_or_else(|| "Intel GPU".into());
+                Some(Card { id: name, name: display, freq, idle, last: None })
+            })
+            .collect();
+        cards.sort_by(|a, b| a.id.cmp(&b.id));
+        cards
+    }
+
+    impl Card {
+        pub fn read(&mut self) -> GpuView {
+            self.read_at(Instant::now())
+        }
+
+        /// `read` as if it were `now`, so tests control the time between reads.
+        fn read_at(&mut self, now: Instant) -> GpuView {
+            let mut util = None;
+            if let Some(idle) = read(&self.idle) {
+                if let Some((prev, at)) = self.last {
+                    let dt = now.duration_since(at).as_secs_f64() * 1000.0;
+                    // A counter that went backwards (wrapped) gives no reading this time.
+                    if dt > 50.0 && idle >= prev {
+                        util = Some((100.0 * (1.0 - (idle - prev) as f64 / dt)).clamp(0.0, 100.0) as f32);
+                    }
+                }
+                self.last = Some((idle, now));
+            }
+            GpuView {
+                name: self.name.clone(),
+                util,
+                // The clock reads 0 while the GPU sleeps.
+                core_mhz: read(&self.freq).map(|m| m as f32),
+                ..Default::default()
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::time::Duration;
+
+        fn card(root: &Path, n: u32, vendor: &str) -> PathBuf {
+            let dev = root.join(format!("pci{n}"));
+            fs::create_dir_all(&dev).unwrap();
+            fs::write(dev.join("vendor"), format!("{vendor}\n")).unwrap();
+            let card = root.join(format!("sys/class/drm/card{n}"));
+            fs::create_dir_all(&card).unwrap();
+            std::os::unix::fs::symlink(&dev, card.join("device")).unwrap();
+            dev
+        }
+
+        #[test]
+        fn xe_and_i915_clock_and_busy_time() {
+            let tmp = std::env::temp_dir().join(format!("oryn-intel-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&tmp);
+            // xe (Raptor Lake on a recent kernel).
+            let xe = card(&tmp, 0, "0x8086").join("tile0/gt0");
+            fs::create_dir_all(xe.join("freq0")).unwrap();
+            fs::create_dir_all(xe.join("gtidle")).unwrap();
+            fs::write(xe.join("freq0/act_freq"), "1250\n").unwrap();
+            fs::write(xe.join("gtidle/idle_residency_ms"), "10000\n").unwrap();
+            // i915, RC6 counter in the older place.
+            card(&tmp, 1, "0x8086");
+            let c1 = tmp.join("sys/class/drm/card1");
+            fs::create_dir_all(c1.join("power")).unwrap();
+            fs::write(c1.join("gt_act_freq_mhz"), "300\n").unwrap();
+            fs::write(c1.join("power/rc6_residency_ms"), "500\n").unwrap();
+            // Not Intel, and an Intel card without clock files: both skipped.
+            card(&tmp, 2, "0x1002");
+            card(&tmp, 3, "0x8086");
+            fs::create_dir_all(tmp.join("sys/class/drm/card0-eDP-1")).unwrap();
+
+            let mut cards = find(&tmp);
+            assert_eq!(cards.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["card0", "card1"]);
+            let t0 = Instant::now();
+            let g = cards[0].read_at(t0);
+            assert_eq!((g.util, g.core_mhz), (None, Some(1250.0)), "first read is only the baseline");
+            assert_eq!(cards[1].read_at(t0).core_mhz, Some(300.0));
+
+            // 2 s later: idle for 1.5 s of them = awake 25 % of the time.
+            fs::write(xe.join("gtidle/idle_residency_ms"), "11500\n").unwrap();
+            fs::write(c1.join("power/rc6_residency_ms"), "2500\n").unwrap();
+            let t1 = t0 + Duration::from_secs(2);
+            assert_eq!(cards[0].read_at(t1).util, Some(25.0));
+            assert_eq!(cards[1].read_at(t1).util, Some(0.0));
+
+            // A counter that went backwards gives no figure rather than nonsense.
+            fs::write(xe.join("gtidle/idle_residency_ms"), "5\n").unwrap();
+            assert_eq!(cards[0].read_at(t1 + Duration::from_secs(1)).util, None);
+            let _ = fs::remove_dir_all(&tmp);
         }
     }
 }
