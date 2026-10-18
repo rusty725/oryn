@@ -405,6 +405,23 @@ pub fn nvme_controller(nda: &str) -> Option<String> {
         .or_else(|| Some(format!("nvme{}", nda.strip_prefix("nda")?)))
 }
 
+/// A disk's firmware revision, from its attach line in the boot log (no
+/// root needed): "ada0: <WDC WD4006FZBX-00CAJA0 01.01A01> ACS-4 …" or
+/// "nda0: <Samsung SSD 9100 PRO 4TB 0B2QNXH7 S7YANJ0Y304429V>" (firmware,
+/// then serial).
+pub fn disk_firmware(name: &str, model: &str) -> Option<String> {
+    let boot = std::fs::read_to_string("/var/run/dmesg.boot").ok()?;
+    parse_boot_firmware(&boot, name, model)
+}
+
+fn parse_boot_firmware(boot: &str, name: &str, model: &str) -> Option<String> {
+    let prefix = format!("{name}: <");
+    // The last attach wins: a disk swapped since boot is listed again.
+    let inner = boot.lines().rev().find_map(|l| l.strip_prefix(&prefix)?.split_once('>').map(|(i, _)| i))?;
+    let fw = inner.strip_prefix(model)?.strip_prefix(' ')?.split_whitespace().next()?;
+    Some(fw.to_string())
+}
+
 /// The disk ("nda0", or "nvd0" with the older driver) on an NVMe controller.
 fn nvme_disk_name(ctrl: &str) -> Option<String> {
     disks()
@@ -1118,6 +1135,20 @@ mod tests {
         let t = parse_topology(xml, 2);
         assert_eq!(t[1].core_id, Some(1));
         assert_eq!(t[1].l3_id, Some(0));
+    }
+
+    #[test]
+    fn firmware_from_boot_log() {
+        let boot = "nda0 at nvme0 bus 0 scbus8 target 0 lun 1\n\
+                    nda0: <Samsung SSD 9100 PRO 4TB 0B2QNXH7 S7YANJ0Y304429V>\n\
+                    ada0: <WDC WD4006FZBX-00CAJA0 01.01A01> ACS-4 ATA SATA 3.x device\n\
+                    ada10: <HGST HDN724040ALE640 MJAOA5E0> ATA8-ACS SATA 3.x device\n";
+        assert_eq!(parse_boot_firmware(boot, "nda0", "Samsung SSD 9100 PRO 4TB").as_deref(), Some("0B2QNXH7"));
+        assert_eq!(parse_boot_firmware(boot, "ada0", "WDC WD4006FZBX-00CAJA0").as_deref(), Some("01.01A01"));
+        // "ada1: <" must not match "ada10: <".
+        assert_eq!(parse_boot_firmware(boot, "ada1", "HGST HDN724040ALE640"), None);
+        // A model GEOM spells differently: no guess.
+        assert_eq!(parse_boot_firmware(boot, "ada0", "WDC WD4006"), None);
     }
 
     #[test]

@@ -228,7 +228,8 @@ impl Specs {
                 (_, Some(true)) => "HDD",
                 _ => "SSD",
             };
-            (g.model.unwrap_or(g.name), g.bytes as f64, kind, None)
+            let firmware = g.model.as_deref().and_then(|m| crate::freebsd::disk_firmware(&g.name, m));
+            (g.model.unwrap_or(g.name), g.bytes as f64, kind, firmware)
         }));
         drives.sort_by(|a, b| a.2.cmp(b.2).then(a.0.cmp(&b.0)));
         for (model, bytes, kind, firmware) in drives {
