@@ -11,7 +11,7 @@ you can show, hide and rearrange.
 
 ![Oryn in the Tokyo Night color scheme](docs/screenshot.png)
 
-<sub>Screenshot: `oryn --demo` (simulated sensors) in the Tokyo Night scheme.</sub>
+<sub>Screenshot: `oryn --demo` in the Tokyo Night scheme, with simulated sensors and load.</sub>
 
 ## Features
 

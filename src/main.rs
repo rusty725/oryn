@@ -59,6 +59,8 @@ mod panels;
 mod power;
 mod procctl;
 mod report;
+#[cfg(test)]
+mod screenshot;
 mod sensors;
 mod smart;
 mod specs;
