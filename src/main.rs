@@ -34,7 +34,7 @@ use ratatui::{
     },
     DefaultTerminal, Frame,
 };
-// FreeBSD uses only its SPD decoding (for DDR5 names read over SMBus).
+// FreeBSD uses only part of it: the SPD and SMBIOS memory decoding.
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[cfg_attr(target_os = "freebsd", allow(dead_code))]
 mod devnames;
@@ -42,23 +42,8 @@ mod battery;
 #[cfg(target_os = "freebsd")]
 mod freebsd;
 mod gpu;
-
-/// Developer/test overrides: `ORYN_<KEY>` (or the pre-rename `TEMPMON_<KEY>`),
-/// e.g. ORYN_SYSFS=/path/to/fake/root.
-pub fn env_os(key: &str) -> Option<std::ffi::OsString> {
-    std::env::var_os(format!("ORYN_{key}")).or_else(|| std::env::var_os(format!("TEMPMON_{key}")))
-}
-
-pub fn env_str(key: &str) -> Option<String> {
-    env_os(key).and_then(|v| v.into_string().ok())
-}
 mod gpustats;
 mod memprobe;
-
-// Counts the bytes Oryn's code holds, for `--mem-probe`; otherwise the
-// system allocator unchanged.
-#[global_allocator]
-static ALLOC: memprobe::Counting = memprobe::Counting;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod nvapi;
 mod panels;
@@ -75,6 +60,21 @@ mod themes;
 use sensors::{DemoSource, Reading, Source};
 use themes::{Theme, THEMES};
 use sysstats::{SysStats, Want};
+
+// Counts the bytes Oryn's code holds, for `--mem-probe`; otherwise the
+// system allocator unchanged.
+#[global_allocator]
+static ALLOC: memprobe::Counting = memprobe::Counting;
+
+/// Developer/test overrides: `ORYN_<KEY>` (or the pre-rename `TEMPMON_<KEY>`),
+/// e.g. ORYN_SYSFS=/path/to/fake/root.
+pub fn env_os(key: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(format!("ORYN_{key}")).or_else(|| std::env::var_os(format!("TEMPMON_{key}")))
+}
+
+pub fn env_str(key: &str) -> Option<String> {
+    env_os(key).and_then(|v| v.into_string().ok())
+}
 
 /// Toggleable panels: (key name, description). Keys 1–9 follow this order.
 const PANELS: [(&str, &str); 9] = [
@@ -145,9 +145,6 @@ fn panels_file() -> Option<std::path::PathBuf> {
     Some(themes::config_dir()?.join("panels"))
 }
 
-/// The saved file lists every panel, hidden ones with a leading "-"
-/// ("sensors,cpu,-proc"). Panels it doesn't mention — ones added in a newer
-/// version — start shown.
 /// User-arranged panel order and columns (the `v` menu: Ctrl+Shift+↑/↓, ←/→).
 #[derive(Clone, PartialEq, Debug)]
 struct PanelLayout {
@@ -241,18 +238,21 @@ fn parse_saved(text: &str) -> Option<([bool; NP], PanelLayout)> {
 }
 
 fn save_panels(show: &[bool; NP], lay: &PanelLayout) {
-    {
-        let parts: Vec<String> = lay
-            .order
-            .iter()
-            .map(|&i| {
-                let side = if lay.left[i] { "L" } else { "R" };
-                let name = PANELS[i].0;
-                if show[i] { format!("{name}:{side}") } else { format!("-{name}:{side}") }
-            })
-            .collect();
-        themes::write_config("panels", &format!("{}\n", parts.join(",")));
-    }
+    themes::write_config("panels", &format!("{}\n", panels_text(show, lay)));
+}
+
+/// "sensors:L,-history:L,cpu:R,…": every panel in order, with its column.
+fn panels_text(show: &[bool; NP], lay: &PanelLayout) -> String {
+    let parts: Vec<String> = lay
+        .order
+        .iter()
+        .map(|&i| {
+            let side = if lay.left[i] { "L" } else { "R" };
+            let name = PANELS[i].0;
+            if show[i] { format!("{name}:{side}") } else { format!("-{name}:{side}") }
+        })
+        .collect();
+    parts.join(",")
 }
 
 const HISTORY_LEN: usize = 120;
@@ -1048,6 +1048,7 @@ fn main() -> io::Result<()> {
         None => themes::load_saved().unwrap_or(0),
     };
     // --panels beats the saved layout; default is everything on.
+    let saved = load_panels();
     let show = match args.iter().position(|a| a == "--panels").and_then(|i| args.get(i + 1)) {
         Some(spec) => match parse_panels(spec) {
             Some(s) => s,
@@ -1059,9 +1060,9 @@ fn main() -> io::Result<()> {
                 std::process::exit(2);
             }
         },
-        None => load_panels().map(|(s, _)| s).unwrap_or([true; NP]),
+        None => saved.as_ref().map_or([true; NP], |(s, _)| *s),
     };
-    let lay = load_panels().map(|(_, l)| l).unwrap_or_default();
+    let lay = saved.map(|(_, l)| l).unwrap_or_default();
     let demo = args.iter().any(|a| a == "--demo");
     let interval_ms = args
         .iter()
@@ -1078,10 +1079,15 @@ fn main() -> io::Result<()> {
         match real_source(Duration::from_millis(interval_ms)) {
             Some(src) => src,
             None => {
+                let hint = if cfg!(target_os = "freebsd") {
+                    "On FreeBSD, load the CPU sensor driver (`sudo kldload amdtemp` for AMD,\n\
+                     `sudo kldload coretemp` for Intel; DDR5: `sudo kldload smb`, run as root)."
+                } else {
+                    "On Linux, load the drivers for your hardware (`sudo sensors-detect`;\n\
+                     CPU: coretemp for Intel, k10temp for AMD; DDR5: spd5118)."
+                };
                 eprintln!(
-                    "No temperature sensors found on this system.\n\
-                     On Linux, load the drivers for your hardware (`sudo sensors-detect`;\n\
-                     CPU: coretemp for Intel, k10temp for AMD; DDR5: spd5118).\n\
+                    "No temperature sensors found on this system.\n{hint}\n\
                      Run `oryn --demo` to try the UI with simulated sensors."
                 );
                 std::process::exit(1);
@@ -1149,7 +1155,7 @@ fn mem_probe(source: Box<dyn Source>) {
     show(memprobe::measure("processes", 150, n, || app.stats.refresh(want(|w| w.procs = true))));
     show(memprobe::measure("CPU power", 150, n, || app.cpu_power.refresh()));
     show(memprobe::measure("RAM power", 150, n, || app.ram_power.refresh()));
-    let gpu_name = if app.gpu.gpus.iter().any(|g| g.nvidia) && !cfg!(not(target_os = "linux")) {
+    let gpu_name = if app.gpu.gpus.iter().any(|g| g.nvidia) && cfg!(target_os = "linux") {
         "GPU panel (nvidia-smi data, NvAPI)"
     } else {
         "GPU panel"
@@ -2214,7 +2220,11 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             }
         }
         None => spans.push(Span::styled(
-            " CPU: no sensor (load coretemp / k10temp) ",
+            if cfg!(target_os = "freebsd") {
+                " CPU: no sensor (kldload amdtemp / coretemp) "
+            } else {
+                " CPU: no sensor (load coretemp / k10temp) "
+            },
             Style::new().fg(th.warn),
         )),
     }
@@ -2631,18 +2641,7 @@ mod tests {
         lay.move_by(P_PROC, -10); // processes to the top
         lay.left[P_CPU] = true; // CPU into the left column
         let show = [true, false, true, true, true, true, true, true, false];
-        let text = {
-            let parts: Vec<String> = lay
-                .order
-                .iter()
-                .map(|&i| {
-                    let side = if lay.left[i] { "L" } else { "R" };
-                    if show[i] { format!("{}:{side}", PANELS[i].0) } else { format!("-{}:{side}", PANELS[i].0) }
-                })
-                .collect();
-            parts.join(",")
-        };
-        let (s2, l2) = parse_saved(&text).unwrap();
+        let (s2, l2) = parse_saved(&panels_text(&show, &lay)).unwrap();
         assert_eq!(s2, show);
         assert_eq!(l2, lay);
         assert_eq!(l2.order[0], P_PROC);

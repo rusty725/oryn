@@ -100,8 +100,11 @@ pub fn alive(pid: u32) -> bool {
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        // Signal 0 only checks that the process exists.
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        // Signal 0 only checks that the process exists; EPERM means it does,
+        // but belongs to another user.
+        // SAFETY: plain syscall with a pid and signal 0.
+        let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(not(unix))]
     {
@@ -244,6 +247,8 @@ mod tests {
         assert!(signal(std::process::id(), Sig::Term).is_err()); // never ourselves
         assert!(signal(0, Sig::Term).is_err()); // never a whole process group
         assert!(renice(0, 5).is_err());
+        #[cfg(unix)]
+        assert!(alive(1), "init: another user's process still counts as running");
         #[cfg(target_os = "linux")]
         {
             assert!(alive(std::process::id()));

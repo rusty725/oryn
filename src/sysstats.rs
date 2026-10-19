@@ -23,10 +23,6 @@ pub fn set_demo() {
 }
 
 pub fn is_demo() -> bool {
-    demo()
-}
-
-fn demo() -> bool {
     DEMO.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -219,7 +215,7 @@ impl SysStats {
             let freqs = core_freqs_mhz(self.sys.cpus());
             self.cpu_freq_mhz = if freqs.is_empty() { 0 } else { freqs.iter().sum::<u64>() / freqs.len() as u64 };
             self.cpu_freq_max_mhz = freqs.iter().copied().max().unwrap_or(0);
-            if demo() {
+            if is_demo() {
                 // Mostly idle desktop with the odd busy thread.
                 self.demo_tick = self.demo_tick.wrapping_add(1);
                 let t = self.demo_tick;
@@ -400,68 +396,66 @@ impl SysStats {
     }
 
     fn read_procs(&mut self) {
-        {
-            // Without tasks: sysinfo would otherwise read and store every
-            // thread of every process too (thousands on a desktop, constantly
-            // created and destroyed by browsers and games). Oryn only lists
-            // processes, so that work and memory were wasted, and on a busy
-            // desktop the memory crept up over time.
-            let kind = ProcessRefreshKind::nothing()
-                .without_tasks()
-                .with_memory()
-                .with_cmd(UpdateKind::OnlyIfNotSet)
-                .with_user(UpdateKind::OnlyIfNotSet);
-            let _guard = libc_buffers();
-            self.sys.refresh_processes_specifics(
-                ProcessesToUpdate::All,
-                true,
-                kind.with_cpu(),
-            );
-            let users = &self.users;
-            let names = &mut self.user_names;
-            let mut list: Vec<ProcInfo> = self
-                .sys
-                .processes()
-                .iter()
-                // Skip threads (sysinfo lists each one too); keep real processes.
-                .filter(|(_, p)| p.thread_kind().is_none())
-                // Zombies have already exited and use nothing; they only wait
-                // for their parent to collect them, and can't be stopped.
-                .filter(|(_, p)| p.status() != sysinfo::ProcessStatus::Zombie)
-                .map(|(pid, p)| {
-                    let user = p
-                        .user_id()
-                        .map(|uid| {
-                            let key = uid.to_string();
-                            names
-                                .entry(key.clone())
-                                .or_insert_with(|| {
-                                    users.get_user_by_id(uid).map(|u| u.name().to_string()).unwrap_or(key)
-                                })
-                                .clone()
-                        })
-                        .unwrap_or_default();
-                    let cmd = p
-                        .cmd()
-                        .iter()
-                        .map(|a| a.to_string_lossy())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    ProcInfo {
-                        pid: pid_u32(pid),
-                        name: p.name().to_string_lossy().to_string(),
-                        cmd: if cmd.is_empty() { format!("[{}]", p.name().to_string_lossy()) } else { cmd },
-                        user,
-                        mem: p.memory(),
-                        cpu: p.cpu_usage(),
-                        nice: crate::procctl::nice_of(pid_u32(pid)),
-                    }
-                })
-                .collect();
-            self.proc_count = list.len();
-            sort_procs(&mut list, self.proc_sort);
-            self.procs = list;
-        }
+        // Without tasks: sysinfo would otherwise read and store every
+        // thread of every process too (thousands on a desktop, constantly
+        // created and destroyed by browsers and games). Oryn only lists
+        // processes, so that work and memory were wasted, and on a busy
+        // desktop the memory crept up over time.
+        let kind = ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_memory()
+            .with_cmd(UpdateKind::OnlyIfNotSet)
+            .with_user(UpdateKind::OnlyIfNotSet);
+        let _guard = libc_buffers();
+        self.sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            kind.with_cpu(),
+        );
+        let users = &self.users;
+        let names = &mut self.user_names;
+        let mut list: Vec<ProcInfo> = self
+            .sys
+            .processes()
+            .iter()
+            // Skip threads (sysinfo lists each one too); keep real processes.
+            .filter(|(_, p)| p.thread_kind().is_none())
+            // Zombies have already exited and use nothing; they only wait
+            // for their parent to collect them, and can't be stopped.
+            .filter(|(_, p)| p.status() != sysinfo::ProcessStatus::Zombie)
+            .map(|(pid, p)| {
+                let user = p
+                    .user_id()
+                    .map(|uid| {
+                        let key = uid.to_string();
+                        names
+                            .entry(key.clone())
+                            .or_insert_with(|| {
+                                users.get_user_by_id(uid).map(|u| u.name().to_string()).unwrap_or(key)
+                            })
+                            .clone()
+                    })
+                    .unwrap_or_default();
+                let cmd = p
+                    .cmd()
+                    .iter()
+                    .map(|a| a.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                ProcInfo {
+                    pid: pid_u32(pid),
+                    name: p.name().to_string_lossy().to_string(),
+                    cmd: if cmd.is_empty() { format!("[{}]", p.name().to_string_lossy()) } else { cmd },
+                    user,
+                    mem: p.memory(),
+                    cpu: p.cpu_usage(),
+                    nice: crate::procctl::nice_of(pid_u32(pid)),
+                }
+            })
+            .collect();
+        self.proc_count = list.len();
+        sort_procs(&mut list, self.proc_sort);
+        self.procs = list;
     }
 
     pub fn resort_procs(&mut self) {
@@ -543,7 +537,7 @@ fn linux_core_freqs(root: &std::path::Path) -> Vec<u64> {
 /// kvm_getargv(3), which return buffers shared by the whole process, so two
 /// refreshes at once (e.g. parallel tests) crash. Hold this around them.
 /// Elsewhere it's a no-op.
-fn libc_buffers() -> impl Drop {
+pub fn libc_buffers() -> impl Drop {
     #[cfg(target_os = "freebsd")]
     {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -684,7 +678,7 @@ pub struct CpuTopo {
 }
 
 pub fn cpu_topology(n: usize) -> Vec<CpuTopo> {
-    if demo() {
+    if is_demo() {
         // 9950X3D: threads 0–7 and 16–23 on CCD1, 8–15 and 24–31 on CCD2.
         return (0..n)
             .map(|i| CpuTopo { core_id: Some((i % 16) as u32), l3_id: Some(((i % 16) / 8) as u32 * 8) })

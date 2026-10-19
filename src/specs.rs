@@ -264,10 +264,20 @@ type Mode = (u32, u32, f64);
 /// root) plus the mode it's showing now, from the DRM driver or, where X11
 /// sets modes past it (the NVIDIA driver), from xrandr:
 /// "DP-3 · LG ULTRAGEAR+ · 3840×2160 · 240 Hz (max 240 Hz) · 31.5″".
+/// Without DRM in sysfs (FreeBSD), the monitors xrandr shows.
 fn monitors(root: &Path) -> Vec<String> {
-    let pnp = ["usr/share/hwdata/pnp.ids", "usr/share/misc/pnp.ids"].iter().find_map(|p| fs::read_to_string(root.join(p)).ok());
+    let pnp = ["usr/share/hwdata/pnp.ids", "usr/share/misc/pnp.ids", "usr/local/share/hwdata/pnp.ids"]
+        .iter()
+        .find_map(|p| fs::read_to_string(root.join(p)).ok());
     // Run at most once, and only when DRM didn't know a monitor's mode.
-    let mut xrandr: Option<Vec<(Vec<u8>, Mode)>> = None;
+    let mut xrandr: Option<Vec<(String, Vec<u8>, Mode)>> = None;
+    let mut run_xrandr = || {
+        if std::env::var_os("DISPLAY").is_none() {
+            return Vec::new();
+        }
+        run_quick("xrandr", &["--current", "--prop"]).map(|t| parse_xrandr(&t)).unwrap_or_default()
+    };
+    let has_drm = fs::read_dir(root.join("sys/class/drm")).is_ok();
     let mut out: Vec<(String, String)> = fs::read_dir(root.join("sys/class/drm"))
         .into_iter()
         .flatten()
@@ -288,13 +298,8 @@ fn monitors(root: &Path) -> Vec<String> {
             #[cfg(not(target_os = "linux"))]
             let current: Option<Mode> = { let _ = card; None };
             let current = current.or_else(|| {
-                let x = xrandr.get_or_insert_with(|| {
-                    if std::env::var_os("DISPLAY").is_none() {
-                        return Vec::new();
-                    }
-                    run_quick("xrandr", &["--current", "--prop"]).map(|t| parse_xrandr(&t)).unwrap_or_default()
-                });
-                x.iter().find(|(e, _)| edid.get(..128) == Some(e.as_slice())).map(|(_, m)| *m)
+                let x = xrandr.get_or_insert_with(&mut run_xrandr);
+                x.iter().find(|(_, e, _)| edid.get(..128) == Some(e.as_slice())).map(|(_, _, m)| *m)
             });
             // Else the preferred mode, which the kernel lists first.
             let mode = current
@@ -304,6 +309,15 @@ fn monitors(root: &Path) -> Vec<String> {
             Some((name.to_string(), format!("{name} · {desc}")))
         })
         .collect();
+    if !has_drm {
+        out = run_xrandr()
+            .into_iter()
+            .filter_map(|(name, edid, (w, h, hz))| {
+                let desc = describe_edid(&edid, Some(format!("{w}×{h}")), Some(hz), pnp.as_deref())?;
+                Some((name.clone(), format!("{name} · {desc}")))
+            })
+            .collect();
+    }
     out.sort();
     out.into_iter().map(|(_, v)| v).collect()
 }
@@ -375,23 +389,24 @@ fn describe_edid(b: &[u8], mode: Option<String>, hz: Option<f64>, pnp: Option<&s
 }
 
 /// The mode each X11 output is showing, from `xrandr --current --prop`
-/// (`--current` doesn't re-probe the displays): (EDID base block, (width,
-/// height, refresh)). The current rate is the one marked `*` in the output's
-/// mode list ("3840x2160    240.08 + 144.05*   60.00").
-fn parse_xrandr(text: &str) -> Vec<(Vec<u8>, Mode)> {
+/// (`--current` doesn't re-probe the displays): (output name, EDID base
+/// block, (width, height, refresh)). The current rate is the one marked `*`
+/// in the output's mode list ("3840x2160    240.08 + 144.05*   60.00").
+fn parse_xrandr(text: &str) -> Vec<(String, Vec<u8>, Mode)> {
     let mut out = Vec::new();
-    let (mut edid, mut mode) = (String::new(), None);
+    let (mut name, mut edid, mut mode) = (String::new(), String::new(), None);
     let mut in_edid = false;
-    let mut flush = |edid: &mut String, mode: &mut Option<Mode>| {
+    let mut flush = |name: &str, edid: &mut String, mode: &mut Option<Mode>| {
         let bytes: Vec<u8> = (0..edid.len() / 2).filter_map(|i| u8::from_str_radix(&edid[2 * i..2 * i + 2], 16).ok()).collect();
         if let (Some(m), Some(base)) = (mode.take(), bytes.get(..128)) {
-            out.push((base.to_vec(), m));
+            out.push((name.to_string(), base.to_vec(), m));
         }
         edid.clear();
     };
     for line in text.lines() {
         if !line.starts_with([' ', '\t']) {
-            flush(&mut edid, &mut mode); // next output (or "Screen 0:")
+            flush(&name, &mut edid, &mut mode); // next output (or "Screen 0:")
+            name = line.split_whitespace().next().unwrap_or("").to_string();
             in_edid = false;
             continue;
         }
@@ -411,7 +426,7 @@ fn parse_xrandr(text: &str) -> Vec<(Vec<u8>, Mode)> {
             }
         }
     }
-    flush(&mut edid, &mut mode);
+    flush(&name, &mut edid, &mut mode);
     out
 }
 
@@ -745,15 +760,10 @@ fn match_desktop(current: &str) -> Option<&'static Desktop> {
 
 /// A known desktop whose process is running here, and that process's PID.
 fn running_desktop(root: &Path) -> Option<(&'static Desktop, u32)> {
-    let mut found: Vec<(usize, u32)> = fs::read_dir(root.join("proc"))
+    let mut found: Vec<(usize, u32)> = process_names(root)
         .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let pid = e.file_name().to_str()?.parse::<u32>().ok()?;
-            let comm = fs::read_to_string(e.path().join("comm")).ok()?;
-            let comm = comm.trim();
-            let i = DESKTOPS.iter().position(|d| d.procs.contains(&comm))?;
+        .filter_map(|(pid, comm)| {
+            let i = DESKTOPS.iter().position(|d| d.procs.contains(&comm.as_str()))?;
             Some((i, pid))
         })
         .collect();
@@ -762,18 +772,59 @@ fn running_desktop(root: &Path) -> Option<(&'static Desktop, u32)> {
     found.first().map(|&(i, pid)| (&DESKTOPS[i], pid))
 }
 
+/// (PID, command name) of every process. FreeBSD's procfs (when mounted at
+/// all) has no `comm` or `environ`, so there they come from sysinfo.
+fn process_names(root: &Path) -> Vec<(u32, String)> {
+    #[cfg(target_os = "freebsd")]
+    if root == Path::new("/") {
+        use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+        let _guard = crate::sysstats::libc_buffers();
+        let sys = System::new_with_specifics(RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()));
+        return sys.processes().iter().map(|(pid, p)| (pid.as_u32(), p.name().to_string_lossy().into_owned())).collect();
+    }
+    fs::read_dir(root.join("proc"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let pid = e.file_name().to_str()?.parse::<u32>().ok()?;
+            let comm = fs::read_to_string(e.path().join("comm")).ok()?;
+            Some((pid, comm.trim().to_string()))
+        })
+        .collect()
+}
+
 /// A process's environment variables (readable for your own processes, or
 /// any as root).
 fn process_env(root: &Path, pid: u32) -> Vec<(String, String)> {
+    #[cfg(target_os = "freebsd")]
+    if root == Path::new("/") {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+        let _guard = crate::sysstats::libc_buffers();
+        let mut sys = System::new();
+        let pid = Pid::from_u32(pid);
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
+        );
+        return sys
+            .process(pid)
+            .map(|p| p.environ().iter().filter_map(|kv| split_env(kv.as_encoded_bytes())).collect())
+            .unwrap_or_default();
+    }
     fs::read(root.join(format!("proc/{pid}/environ")))
         .unwrap_or_default()
         .split(|&b| b == 0)
-        .filter_map(|kv| {
-            let kv = String::from_utf8_lossy(kv);
-            let (k, v) = kv.split_once('=')?;
-            Some((k.to_string(), v.to_string()))
-        })
+        .filter_map(split_env)
         .collect()
+}
+
+/// "KEY=value" -> (KEY, value).
+fn split_env(kv: &[u8]) -> Option<(String, String)> {
+    let kv = String::from_utf8_lossy(kv);
+    let (k, v) = kv.split_once('=')?;
+    Some((k.to_string(), v.to_string()))
 }
 
 /// Run `cmd arg` (e.g. "gnome-shell --version") and pick the version number
@@ -1054,8 +1105,8 @@ mod tests {
         );
         let modes = parse_xrandr(&text);
         assert_eq!(modes.len(), 2, "the switched-off DP-6 has no current mode");
-        assert_eq!((modes[0].0[8], modes[0].1), (1, (3840, 2160, 144.05)));
-        assert_eq!((modes[1].0[8], modes[1].1), (2, (2560, 1440, 59.95)));
+        assert_eq!((modes[0].0.as_str(), modes[0].1[8], modes[0].2), ("DP-4", 1, (3840, 2160, 144.05)));
+        assert_eq!((modes[1].0.as_str(), modes[1].1[8], modes[1].2), ("DP-5", 2, (2560, 1440, 59.95)));
     }
 
     #[test]
