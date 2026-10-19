@@ -9,9 +9,9 @@ critical limit, min/max, trend and history graph. Around it sit btop-style
 panels for CPU, GPU, memory, disks, network, processes and system specs, which
 you can show, hide and rearrange.
 
-![Oryn in the Tokyo Night color scheme](docs/screenshot.png)
+![Oryn on Linux in the Tokyo Night color scheme](docs/screenshot.png)
 
-<sub>Screenshot: `oryn --demo` in the Tokyo Night scheme, with simulated sensors and load.</sub>
+<sub>Screenshot: `oryn --demo` on Linux in the Tokyo Night scheme, with simulated sensors and load.</sub>
 
 ![Oryn on FreeBSD 15.1 with a Ryzen 9 9950X3D and an RTX 5080](docs/screenshot-freebsd.png)
 
