@@ -80,9 +80,11 @@ you can show, hide and rearrange.
 
 ## Installation
 
-Every [release](https://github.com/rusty725/oryn/releases/latest) has
-ready-made packages for x86_64 (64-bit Intel/AMD). On other machines
-(aarch64…), [build from source](#any-linux-distribution-from-source).
+The [releases](https://github.com/rusty725/oryn/releases) have
+ready-made packages for x86_64 (64-bit Intel/AMD): the Linux ones below are
+from [v0.1.7](https://github.com/rusty725/oryn/releases/tag/v0.1.7), the
+FreeBSD ones from [v0.1.8](https://github.com/rusty725/oryn/releases/tag/v0.1.8).
+On other machines (aarch64…), [build from source](#any-linux-distribution-from-source).
 
 | Package | For |
 |---------|-----|
@@ -90,8 +92,8 @@ ready-made packages for x86_64 (64-bit Intel/AMD). On other machines
 | `oryn_0.1.7-1_amd64.deb` | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS |
 | `oryn-0.1.7-1.x86_64.rpm` | Fedora, RHEL / Rocky / Alma 9+, openSUSE |
 | `oryn-0.1.7-x86_64-linux.tar.gz` | any other x86_64 Linux with glibc 2.34+ |
-| `oryn-0.1.7-freebsd-amd64.pkg` | FreeBSD 15 (amd64), installed with `pkg` |
-| `oryn-0.1.7-amd64-freebsd.tar.gz` | FreeBSD 15 (amd64): binary, man page and instructions |
+| `oryn-0.1.8-freebsd-amd64.pkg` | FreeBSD 15 (amd64), installed with `pkg` |
+| `oryn-0.1.8-amd64-freebsd.tar.gz` | FreeBSD 15 (amd64): binary, man page and instructions |
 
 Each package installs the `oryn` command and its man page (`man oryn`).
 The commands below download the file into the current folder and install
@@ -175,16 +177,16 @@ cargo install --locked --git https://github.com/rusty725/oryn
 Built on FreeBSD 15.1-RELEASE (amd64). With the package:
 
 ```sh
-fetch https://github.com/rusty725/oryn/releases/download/v0.1.7/oryn-0.1.7-freebsd-amd64.pkg
-sudo pkg add ./oryn-0.1.7-freebsd-amd64.pkg
+fetch https://github.com/rusty725/oryn/releases/download/v0.1.8/oryn-0.1.8-freebsd-amd64.pkg
+sudo pkg add ./oryn-0.1.8-freebsd-amd64.pkg
 ```
 
 Or with the .tar.gz:
 
 ```sh
-fetch https://github.com/rusty725/oryn/releases/download/v0.1.7/oryn-0.1.7-amd64-freebsd.tar.gz
-tar xzf oryn-0.1.7-amd64-freebsd.tar.gz
-cd oryn-0.1.7-amd64-freebsd
+fetch https://github.com/rusty725/oryn/releases/download/v0.1.8/oryn-0.1.8-amd64-freebsd.tar.gz
+tar xzf oryn-0.1.8-amd64-freebsd.tar.gz
+cd oryn-0.1.8-amd64-freebsd
 sudo install -m 755 oryn /usr/local/bin/oryn
 sudo install -m 644 oryn.1 /usr/local/share/man/man1/oryn.1
 ```
