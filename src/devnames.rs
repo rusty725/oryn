@@ -437,11 +437,25 @@ pub fn note_spd(b: &[u8]) {
     }
 }
 
-/// "CL30-36-36-76 (EXPO)": the timings for the speed the memory runs at
-/// (`mts`, from SMBIOS). When no SPD profile is for that speed (set by hand
-/// in the BIOS), the stick's own top rating instead, marked as such:
-/// "rated CL32-39-39-102 @ 6400 (XMP)"; the SPD can't say what was set.
+/// CL, tRCD, tRP, tRAS the memory controller is running, where it can be
+/// read (AMD's UMC on FreeBSD).
+static CURRENT_TIMINGS: std::sync::Mutex<Option<[u32; 4]>> = std::sync::Mutex::new(None);
+
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+pub fn note_current_timings(t: [u32; 4]) {
+    *CURRENT_TIMINGS.lock().unwrap() = Some(t);
+}
+
+/// The timings for the specs panel: those in use ("CL32-38-38-76") when
+/// the memory controller could be read. Otherwise from the SPD: the
+/// profile for the speed the memory runs at (`mts`, from SMBIOS), as
+/// "CL30-36-36-76 (EXPO)"; when no profile is for that speed (set by hand
+/// in the BIOS), the stick's own top rating, marked as such: "rated
+/// CL32-39-39-102 @ 6400 (XMP)".
 pub fn ram_timings_text(mts: Option<u32>) -> Option<String> {
+    if let Some([cl, rcd, rp, ras]) = *CURRENT_TIMINGS.lock().unwrap() {
+        return Some(format!("CL{cl}-{rcd}-{rp}-{ras}"));
+    }
     timings_for(&SPD_TIMINGS.lock().unwrap(), mts)
 }
 

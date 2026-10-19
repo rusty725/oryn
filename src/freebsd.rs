@@ -667,6 +667,7 @@ impl RamSource {
         let mut buses = Vec::new();
         let mut dimms = Vec::new();
         let mut note = None;
+        let mut ddr5 = false;
         let has_smbus = sysctl_str("dev.smbus.0.%driver").is_some();
         for n in 0.. {
             if sysctl_str(&format!("dev.smb.{n}.%driver")).is_none() {
@@ -692,24 +693,30 @@ impl RamSource {
                     (Some(lo), Some(hi)) => Some(spd5118_temp(lo, hi)).filter(|c| *c > 30.0 && *c < 150.0),
                     _ => None,
                 };
-                let model = spd5118_name(&dev, addr).unwrap_or_else(|| format!("RAM DIMM @0x{addr:02x}"));
+                // Maker and part number; the SPD's rated timings go to the specs panel.
+                let spd = spd5118_read(&dev, addr).ok();
+                if let Some(s) = &spd {
+                    crate::devnames::note_spd(s);
+                    ddr5 |= s[2] == 0x12;
+                }
+                let model = spd
+                    .as_deref()
+                    .and_then(crate::devnames::parse_spd)
+                    .unwrap_or_else(|| format!("RAM DIMM @0x{addr:02x}"));
                 dimms.push(Dimm { bus: buses.len(), addr, model, critical: crit });
             }
             buses.push(dev);
+        }
+        // The timings in use, from the memory controller (read once, here,
+        // before sampling starts).
+        if ddr5 && let Ok((_, t)) = umc_timings() {
+            crate::devnames::note_current_timings(t);
         }
         if dimms.is_empty() && note.is_none() && has_smbus && sysctl_str("dev.smb.0.%driver").is_none() {
             note = Some("kldload smb");
         }
         Self { buses, dimms, note }
     }
-}
-
-/// Maker and part number from the SPD EEPROM behind an SPD5118 hub; its
-/// timings are handed to `devnames::note_spd` for the specs panel.
-fn spd5118_name(dev: &std::fs::File, addr: u8) -> Option<String> {
-    let spd = spd5118_read(dev, addr).ok()?;
-    crate::devnames::note_spd(&spd);
-    crate::devnames::parse_spd(&spd)
 }
 
 /// The parts of the SPD EEPROM behind an SPD5118 hub that Oryn uses (the
@@ -755,6 +762,127 @@ fn spd5118_read(dev: &std::fs::File, addr: u8) -> Result<Vec<u8>, String> {
     })();
     let _ = smb_write(dev, addr, MR_LEGACY_PAGE, saved);
     ok.map(|_| spd)
+}
+
+// ---------------------------------------------------------------------------
+// Current RAM timings from AMD's memory controller
+// ---------------------------------------------------------------------------
+
+/// struct pci_io from <sys/pciio.h>.
+#[repr(C)]
+struct PciIo {
+    sel: PciSel,
+    reg: libc::c_int,
+    width: libc::c_int,
+    data: u32,
+}
+
+const PCIOCREAD: libc::c_ulong = iowr(b'p', 2, std::mem::size_of::<PciIo>());
+const PCIOCWRITE: libc::c_ulong = iowr(b'p', 3, std::mem::size_of::<PciIo>());
+/// SMN index/data pair in the host bridge's config space (Zen and later),
+/// the one FreeBSD's amdsmn(4) uses.
+const SMN_INDEX: libc::c_int = 0x60;
+const SMN_DATA: libc::c_int = 0x64;
+
+/// AMD's System Management Network, reached through the host bridge (PCI
+/// 0:0:0) from userland: write the address to the index register, read the
+/// data register. Root only (/dev/pci opened for writing).
+struct Smn {
+    pci: std::fs::File,
+}
+
+impl Smn {
+    fn open() -> Result<Self, String> {
+        let pci = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/pci")
+            .map_err(|e| format!("/dev/pci: {e}"))?;
+        let smn = Smn { pci };
+        match smn.config(PCIOCREAD, 0, 0) {
+            Some(id) if id & 0xFFFF == 0x1022 => Ok(smn),
+            _ => Err("host bridge 0:0:0 isn't AMD's".into()),
+        }
+    }
+
+    fn config(&self, op: libc::c_ulong, reg: libc::c_int, data: u32) -> Option<u32> {
+        use std::os::fd::AsRawFd;
+        let mut io = PciIo { sel: PciSel::default(), reg, width: 4, data };
+        // SAFETY: PCIOCREAD/PCIOCWRITE on a struct pci_io we own.
+        (unsafe { libc::ioctl(self.pci.as_raw_fd(), op, &mut io) } == 0).then_some(io.data)
+    }
+
+    /// One SMN register. The kernel's amdtemp uses the same index/data pair
+    /// under a lock userland can't take, so a value only counts if two reads
+    /// agree.
+    fn read(&self, addr: u32) -> Option<u32> {
+        let once = || {
+            self.config(PCIOCWRITE, SMN_INDEX, addr)?;
+            self.config(PCIOCREAD, SMN_DATA, 0)
+        };
+        (0..3).find_map(|_| {
+            let a = once()?;
+            (once()? == a).then_some(a)
+        })
+    }
+}
+
+/// AMD family from CPUID ("AuthenticAMD" only), e.g. 0x19 (Zen 3/4) or 0x1A (Zen 5).
+fn amd_family() -> Option<u32> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::__cpuid;
+        let (v, l1) = (__cpuid(0), __cpuid(1));
+        let vendor = [v.ebx, v.edx, v.ecx].iter().flat_map(|r| r.to_le_bytes()).collect::<Vec<u8>>();
+        if vendor != b"AuthenticAMD" {
+            return None;
+        }
+        let base = (l1.eax >> 8) & 0xF;
+        Some(if base == 0xF { base + ((l1.eax >> 20) & 0xFF) } else { base })
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    None
+}
+
+/// The primary timings (CL, tRCD, tRP, tRAS) the memory controller runs:
+/// the first populated channel's UMC registers, on Zen 4 / Zen 5 with DDR5.
+/// Channels are 1 << 20 apart; a channel is in use when bit 19 of 0x50DF0
+/// is clear and a DIMM is present (bit 0 of 0x50000 or 0x50008). Register
+/// layout as documented by ZenStates-Core (Dictionaries/DDR5Dictionary.cs,
+/// MemoryConfig.cs), which ZenTimings uses. Only reads.
+pub fn umc_timings() -> Result<(u32, [u32; 4]), String> {
+    match amd_family() {
+        Some(f) if f >= 0x19 => {}
+        _ => return Err("not an AMD Zen 4/5 CPU".into()),
+    }
+    let smn = Smn::open()?;
+    for ch in 0..12u32 {
+        let base = ch << 20;
+        let Some(ctrl) = smn.read(base | 0x50DF0) else { continue };
+        if ctrl == u32::MAX || ctrl & (1 << 19) != 0 {
+            continue;
+        }
+        let dimm = |off| smn.read(base | off).is_some_and(|v| v != u32::MAX && v & 1 == 1);
+        if !dimm(0x50000) && !dimm(0x50008) {
+            continue;
+        }
+        let (Some(a), Some(b)) = (smn.read(base | 0x50204), smn.read(base | 0x50208)) else {
+            return Err(format!("channel {ch}: timing registers unreadable"));
+        };
+        return decode_umc(a, b).map(|t| (ch, t)).ok_or(format!("channel {ch}: implausible values {a:#010x} {b:#010x}"));
+    }
+    Err("no populated memory channel found".into())
+}
+
+/// CL, tRCD (read), tRP, tRAS from UMC registers 0x50204 and 0x50208.
+fn decode_umc(r204: u32, r208: u32) -> Option<[u32; 4]> {
+    if r204 == u32::MAX || r208 == u32::MAX {
+        return None; // what an absent register reads as
+    }
+    let bits = |v: u32, hi: u32, lo: u32| (v >> lo) & ((1 << (hi - lo + 1)) - 1);
+    let t = [bits(r204, 5, 0), bits(r204, 21, 16), bits(r208, 21, 16), bits(r204, 14, 8)];
+    let ok = t[..3].iter().all(|v| (8..=80).contains(v)) && (16..=127).contains(&t[3]);
+    ok.then_some(t)
 }
 
 /// `oryn --ram-info`: each step behind the RAM names, temperatures, speed and
@@ -823,6 +951,15 @@ pub fn ram_report() -> String {
     };
     let _ = writeln!(out, "  sticks: {:?}", dmi.sticks);
     let _ = writeln!(out, "  speed: {} (MT/s for timings: {:?})", dmi.speed.as_deref().unwrap_or("unknown"), dmi.mts);
+    match umc_timings() {
+        Ok((ch, t)) => {
+            let _ = writeln!(out, "Memory controller (UMC channel {ch}): CL{}-{}-{}-{} in use", t[0], t[1], t[2], t[3]);
+            crate::devnames::note_current_timings(t);
+        }
+        Err(e) => {
+            let _ = writeln!(out, "Memory controller: {e}{}", if crate::nvapi::is_root() { "" } else { " (run with sudo)" });
+        }
+    }
     let _ = writeln!(out, "Timings shown in specs: {}", crate::devnames::ram_timings_text(dmi.mts)
         .unwrap_or_else(|| "none (no SPD timings read)".into()));
     out
@@ -1312,6 +1449,24 @@ mod tests {
         assert_eq!(spd5118_temp(0x64, 0x02), 38.25); // 153 quarter degrees
         assert_eq!(spd5118_temp(0xF0, 0x1F), -1.0); // sign bit 12
         assert_eq!(spd5118_temp(0x30, 0x05), 83.0); // a typical critical limit
+    }
+
+    #[test]
+    fn umc_timing_registers() {
+        // Checked against <sys/pciio.h> on FreeBSD 15 (amd64).
+        assert_eq!(std::mem::size_of::<PciIo>(), 20);
+        assert_eq!((PCIOCREAD, PCIOCWRITE), (0xC014_7002, 0xC014_7003));
+        // 0x50204: RCDWR 29:24, RCDRD 21:16, RAS 14:8, CL 5:0.
+        // 0x50208: RPpb 29:24, RP 21:16, RCpb 15:8, RC 7:0.
+        let r204 = (36 << 24) | (38 << 16) | (76 << 8) | 32;
+        let r208 = (38 << 24) | (38 << 16) | (114 << 8) | 114;
+        assert_eq!(decode_umc(r204, r208), Some([32, 38, 38, 76]));
+        assert_eq!(decode_umc(u32::MAX, u32::MAX), None); // unreadable
+        assert_eq!(decode_umc(0, 0), None);
+        // This machine's CPU, when it's AMD.
+        if cpu_model().is_some_and(|m| m.contains("AMD")) {
+            assert!(amd_family().is_some_and(|f| f >= 0x17));
+        }
     }
 
     #[test]

@@ -203,7 +203,7 @@ so the package installs nothing else. These are optional and add readings:
 |----------|--------------|-----|
 | `amdtemp` / `coretemp` kernel module | CPU temperatures (AMD / Intel) | `kldload amdtemp` |
 | `cpuctl` kernel module | CPU power draw in watts (root) | `kldload cpuctl` |
-| `smb` kernel module | DDR5 RAM temperatures and part numbers (root) | `kldload smb` |
+| `smb` kernel module | DDR5 RAM temperatures, part numbers and timings (root; on AMD Zen 4/5 the timings in use, read from the memory controller) | `kldload smb` |
 | `smartmontools` package | SATA drive temperatures, SMART data | `pkg install smartmontools` |
 | `dmidecode` package | RAM model and speed without root (with a sudoers rule) | `pkg install dmidecode` |
 | `nvidia-driver` package | NVIDIA GPU panel (`nvidia-smi`) | `pkg install nvidia-driver` |
