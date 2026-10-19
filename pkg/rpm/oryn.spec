@@ -8,7 +8,7 @@
 %global _docdir_fmt %{name}
 
 Name:           oryn
-Version:        0.1.7
+Version:        0.1.9
 Release:        1%{?dist}
 Summary:        Terminal hardware monitor with every temperature sensor
 
@@ -57,6 +57,12 @@ install -Dm0644 doc/oryn.1 %{buildroot}%{_mandir}/man1/oryn.1
 %{_mandir}/man1/oryn.1*
 
 %changelog
+* Sun Oct 18 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.9-1
+- Specs panel: RAM speed and timings from the sticks' SPD (JEDEC, EXPO,
+  XMP 3.0) and the BIOS.
+- Specs panel: monitors with model, resolution, current and maximum refresh
+  rate and size.
+
 * Sun Oct 18 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.7-1
 - Short windows: panels that don't fit scroll with PgUp/PgDn or the wheel
   instead of being hidden; the bottom bar lists what's above and below.

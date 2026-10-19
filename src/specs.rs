@@ -155,6 +155,9 @@ impl Specs {
             }
             add("GPU", "GPU", v);
         }
+        for m in monitors(&r) {
+            add("Monitor", "GPU", m);
+        }
 
         // RAM: total, then each stick (identical sticks grouped: "2 × …").
         let mut ram = format!("{:.0} GB", mem_total as f64 / 1024f64.powi(3));
@@ -253,6 +256,282 @@ impl Specs {
 
         Specs { lines }
     }
+}
+
+/// A display's current mode: (width, height, refresh in Hz).
+type Mode = (u32, u32, f64);
+
+/// Connected monitors, from each display connector's EDID (readable without
+/// root) plus the mode it's showing now, from the DRM driver or, where X11
+/// sets modes past it (the NVIDIA driver), from xrandr:
+/// "DP-3 · LG ULTRAGEAR+ · 3840×2160 · 240 Hz (max 240 Hz) · 31.5″".
+fn monitors(root: &Path) -> Vec<String> {
+    let pnp = ["usr/share/hwdata/pnp.ids", "usr/share/misc/pnp.ids"].iter().find_map(|p| fs::read_to_string(root.join(p)).ok());
+    // Run at most once, and only when DRM didn't know a monitor's mode.
+    let mut xrandr: Option<Vec<(Vec<u8>, Mode)>> = None;
+    let mut out: Vec<(String, String)> = fs::read_dir(root.join("sys/class/drm"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let dir = e.path();
+            if read(&dir.join("status")).as_deref() != Some("connected") {
+                return None;
+            }
+            let edid = fs::read(dir.join("edid")).ok()?;
+            // "card1-DP-3" -> card "card1", connector "DP-3".
+            let file = e.file_name().to_string_lossy().to_string();
+            let (card, name) = file.split_once('-')?;
+            #[cfg(target_os = "linux")]
+            let current = read(&dir.join("connector_id"))
+                .and_then(|id| id.parse().ok())
+                .and_then(|id| current_mode(&root.join("dev/dri").join(card), id));
+            #[cfg(not(target_os = "linux"))]
+            let current: Option<Mode> = { let _ = card; None };
+            let current = current.or_else(|| {
+                let x = xrandr.get_or_insert_with(|| {
+                    if std::env::var_os("DISPLAY").is_none() {
+                        return Vec::new();
+                    }
+                    run_quick("xrandr", &["--current", "--prop"]).map(|t| parse_xrandr(&t)).unwrap_or_default()
+                });
+                x.iter().find(|(e, _)| edid.get(..128) == Some(e.as_slice())).map(|(_, m)| *m)
+            });
+            // Else the preferred mode, which the kernel lists first.
+            let mode = current
+                .map(|(w, h, _)| format!("{w}×{h}"))
+                .or_else(|| read(&dir.join("modes")).and_then(|m| m.lines().next().map(|l| l.replace('x', "×"))));
+            let desc = describe_edid(&edid, mode, current.map(|c| c.2), pnp.as_deref())?;
+            Some((name.to_string(), format!("{name} · {desc}")))
+        })
+        .collect();
+    out.sort();
+    out.into_iter().map(|(_, v)| v).collect()
+}
+
+/// "LG ULTRAGEAR+ · 3840×2160 · 144 Hz (max 240 Hz) · 31.5″" from an EDID
+/// block (VESA E-EDID 1.4). `mode`: the current or preferred resolution,
+/// else it's taken from the first detailed timing; `hz`: the current
+/// refresh rate, if known.
+fn describe_edid(b: &[u8], mode: Option<String>, hz: Option<f64>, pnp: Option<&str>) -> Option<String> {
+    if b.len() < 128 || b[..8] != [0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0] {
+        return None;
+    }
+    // Maker: three 5-bit letters at bytes 8–9 ("GSM"), named from pnp.ids.
+    let id = u16::from_be_bytes([b[8], b[9]]);
+    let code: String = [10, 5, 0].iter().map(|s| (b'A' - 1 + ((id >> s) & 0x1f) as u8) as char).collect();
+    let maker = match code.as_str() {
+        "ACI" => "ASUS".to_string(), // registered as "Ancor Communications"
+        _ => pnp
+            .and_then(|db| db.lines().find_map(|l| l.strip_prefix(&format!("{code}\t"))))
+            .and_then(|n| n.split_whitespace().next())
+            .map(|n| n.trim_end_matches([',', '.']).to_string())
+            .unwrap_or(code),
+    };
+    // Four 18-byte descriptors: a detailed timing (pixel clock ≠ 0) or a
+    // tagged one: 0xFC monitor name, 0xFE text (laptop panels), 0xFD limits.
+    let descriptors: Vec<&[u8]> = (0..4).map(|i| &b[54 + 18 * i..72 + 18 * i]).collect();
+    let text = |tag: u8| {
+        descriptors
+            .iter()
+            .filter(|d| d[..3] == [0, 0, 0] && d[3] == tag)
+            .map(|d| String::from_utf8_lossy(&d[5..]).split('\n').next().unwrap_or("").trim().to_string())
+            .rfind(|s| !s.is_empty())
+    };
+    let model = text(0xfc).or_else(|| text(0xfe)).unwrap_or_else(|| format!("{:04X}", u16::from_le_bytes([b[10], b[11]])));
+    let mut parts = vec![if model.to_ascii_lowercase().contains(&maker.to_ascii_lowercase()) { model } else { format!("{maker} {model}") }];
+
+    let timing = descriptors.iter().find(|d| d[0] != 0 || d[1] != 0);
+    let mode = mode.or_else(|| {
+        let d = timing?;
+        let h = d[2] as u32 | ((d[4] as u32 >> 4) << 8);
+        let v = d[5] as u32 | ((d[7] as u32 >> 4) << 8);
+        Some(format!("{h}×{v}"))
+    });
+    parts.extend(mode);
+    // Range limits: max vertical rate at byte 6, +255 when flag bit 1 is set.
+    let max = descriptors
+        .iter()
+        .find(|d| d[..3] == [0, 0, 0] && d[3] == 0xfd)
+        .map(|d| d[6] as u32 + if d[4] & 0x02 != 0 { 255 } else { 0 })
+        .filter(|&m| m > 0);
+    // 59.94 Hz stays exact; 239.99 is 240.
+    let rate = |h: f64| if (h - h.round()).abs() < 0.05 { format!("{h:.0} Hz") } else { format!("{h:.2} Hz") };
+    match (hz, max) {
+        (Some(c), Some(m)) => parts.push(format!("{} (max {m} Hz)", rate(c))),
+        (Some(c), None) => parts.push(rate(c)),
+        (None, Some(m)) => parts.push(format!("max {m} Hz")),
+        (None, None) => {}
+    }
+    // Size: the detailed timing's mm, else the basic cm at bytes 21–22.
+    let mm = timing
+        .map(|d| (d[12] as f64 + ((d[14] >> 4) as f64) * 256.0, d[13] as f64 + ((d[14] & 0x0f) as f64) * 256.0))
+        .filter(|&(w, h)| w > 0.0 && h > 0.0)
+        .or_else(|| (b[21] > 0 && b[22] > 0).then(|| (b[21] as f64 * 10.0, b[22] as f64 * 10.0)));
+    if let Some((w, h)) = mm {
+        let inches = (w * w + h * h).sqrt() / 25.4;
+        parts.push(if (inches - inches.round()).abs() < 0.05 { format!("{:.0}″", inches) } else { format!("{inches:.1}″") });
+    }
+    Some(parts.join(" · "))
+}
+
+/// The mode each X11 output is showing, from `xrandr --current --prop`
+/// (`--current` doesn't re-probe the displays): (EDID base block, (width,
+/// height, refresh)). The current rate is the one marked `*` in the output's
+/// mode list ("3840x2160    240.08 + 144.05*   60.00").
+fn parse_xrandr(text: &str) -> Vec<(Vec<u8>, Mode)> {
+    let mut out = Vec::new();
+    let (mut edid, mut mode) = (String::new(), None);
+    let mut in_edid = false;
+    let mut flush = |edid: &mut String, mode: &mut Option<Mode>| {
+        let bytes: Vec<u8> = (0..edid.len() / 2).filter_map(|i| u8::from_str_radix(&edid[2 * i..2 * i + 2], 16).ok()).collect();
+        if let (Some(m), Some(base)) = (mode.take(), bytes.get(..128)) {
+            out.push((base.to_vec(), m));
+        }
+        edid.clear();
+    };
+    for line in text.lines() {
+        if !line.starts_with([' ', '\t']) {
+            flush(&mut edid, &mut mode); // next output (or "Screen 0:")
+            in_edid = false;
+            continue;
+        }
+        let t = line.trim();
+        if t == "EDID:" {
+            in_edid = true;
+        } else if in_edid && !t.is_empty() && t.chars().all(|c| c.is_ascii_hexdigit()) {
+            edid.push_str(t);
+        } else {
+            in_edid = false;
+            // A mode line: "WxH" then its rates.
+            let mut words = t.split_whitespace();
+            let Some((w, h)) = words.next().and_then(|r| r.split_once('x')) else { continue };
+            let (Ok(w), Ok(h)) = (w.parse(), h.trim_end_matches('i').parse()) else { continue };
+            if let Some(hz) = words.find(|r| r.contains('*')).and_then(|r| r.trim_end_matches(['*', '+']).parse().ok()) {
+                mode = Some((w, h, hz));
+            }
+        }
+    }
+    flush(&mut edid, &mut mode);
+    out
+}
+
+/// The mode a display connector is showing now: (width, height, refresh
+/// in Hz), from the DRM driver's read-only mode queries (connector ->
+/// encoder -> CRTC) on `card` (/dev/dri/cardN, which the logged-in user can
+/// open). None when the display is off or the device can't be opened.
+#[cfg(target_os = "linux")]
+fn current_mode(card: &Path, connector_id: u32) -> Option<Mode> {
+    use std::os::fd::AsRawFd;
+
+    // Structures from the kernel's include/uapi/drm/drm_mode.h.
+    #[repr(C)]
+    #[derive(Default)]
+    struct GetConnector {
+        encoders_ptr: u64,
+        modes_ptr: u64,
+        props_ptr: u64,
+        prop_values_ptr: u64,
+        count_modes: u32,
+        count_props: u32,
+        count_encoders: u32,
+        encoder_id: u32,
+        connector_id: u32,
+        connector_type: u32,
+        connector_type_id: u32,
+        connection: u32,
+        mm_width: u32,
+        mm_height: u32,
+        subpixel: u32,
+        pad: u32,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct GetEncoder {
+        encoder_id: u32,
+        encoder_type: u32,
+        crtc_id: u32,
+        possible_crtcs: u32,
+        possible_clones: u32,
+    }
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct ModeInfo {
+        clock: u32,
+        hdisplay: u16,
+        hsync_start: u16,
+        hsync_end: u16,
+        htotal: u16,
+        hskew: u16,
+        vdisplay: u16,
+        vsync_start: u16,
+        vsync_end: u16,
+        vtotal: u16,
+        vscan: u16,
+        vrefresh: u32,
+        flags: u32,
+        kind: u32,
+        name: [u8; 32],
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct Crtc {
+        set_connectors_ptr: u64,
+        count_connectors: u32,
+        crtc_id: u32,
+        fb_id: u32,
+        x: u32,
+        y: u32,
+        gamma_size: u32,
+        mode_valid: u32,
+        mode: ModeInfo,
+    }
+    const _: () = assert!(
+        std::mem::size_of::<GetConnector>() == 80 && std::mem::size_of::<GetEncoder>() == 20 && std::mem::size_of::<Crtc>() == 104
+    );
+    // DRM_IOWR('d', nr, T).
+    fn iowr<T>(nr: u64) -> u64 {
+        (3 << 30) | ((std::mem::size_of::<T>() as u64) << 16) | ((b'd' as u64) << 8) | nr
+    }
+    fn ioctl<T>(fd: i32, nr: u64, arg: &mut T) -> Option<()> {
+        // SAFETY: `arg` is the #[repr(C)] struct this request reads and writes.
+        (unsafe { libc::ioctl(fd, iowr::<T>(nr) as _, arg as *mut T) } == 0).then_some(())
+    }
+
+    let file = fs::File::open(card).ok()?;
+    let fd = file.as_raw_fd();
+    // Room for one mode, so count_modes isn't 0: a 0 there asks the driver
+    // to re-probe the display, which can make it flicker.
+    let mut one = ModeInfo::default();
+    let mut conn = GetConnector { connector_id, count_modes: 1, modes_ptr: &mut one as *mut ModeInfo as u64, ..Default::default() };
+    ioctl(fd, 0xA7, &mut conn)?;
+    let mut enc = GetEncoder { encoder_id: conn.encoder_id, ..Default::default() };
+    if conn.encoder_id == 0 {
+        return None;
+    }
+    ioctl(fd, 0xA6, &mut enc)?;
+    let mut crtc = Crtc { crtc_id: enc.crtc_id, ..Default::default() };
+    if enc.crtc_id == 0 {
+        return None;
+    }
+    ioctl(fd, 0xA1, &mut crtc)?;
+    let m = crtc.mode;
+    if crtc.mode_valid == 0 || m.htotal == 0 || m.vtotal == 0 {
+        return None;
+    }
+    // Pixel clock (kHz) over pixels per frame; interlaced modes show two
+    // fields per frame, double-scanned ones draw each line twice.
+    let mut hz = m.clock as f64 * 1000.0 / (m.htotal as f64 * m.vtotal as f64);
+    if m.flags & (1 << 4) != 0 {
+        hz *= 2.0;
+    }
+    if m.flags & (1 << 5) != 0 {
+        hz /= 2.0;
+    }
+    if m.vscan > 1 {
+        hz /= m.vscan as f64;
+    }
+    Some((m.hdisplay as u32, m.vdisplay as u32, hz))
 }
 
 /// Network adapters (not virtual ones), sorted: "enp8s0 · Realtek RTL8126
@@ -499,12 +778,18 @@ fn process_env(root: &Path, pid: u32) -> Vec<(String, String)> {
 }
 
 /// Run `cmd arg` (e.g. "gnome-shell --version") and pick the version number
-/// out of what it prints. Gives up after a second.
+/// out of what it prints.
 fn command_version(cmd: &str, arg: &str) -> Option<String> {
+    parse_version(&run_quick(cmd, &[arg])?)
+}
+
+/// Run a command and return what it printed (stdout, then stderr). Gives
+/// up after a second.
+fn run_quick(cmd: &str, args: &[&str]) -> Option<String> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
     let mut child = Command::new(cmd)
-        .arg(arg)
+        .args(args)
         // Qt programs (plasmashell, lxqt-session) want a display before they
         // even print their version; this lets them run without one (sudo, SSH).
         .env("QT_QPA_PLATFORM", "offscreen")
@@ -526,9 +811,8 @@ fn command_version(cmd: &str, arg: &str) -> Option<String> {
         }
     }
     let out = child.wait_with_output().ok()?;
-    // Some print it on stderr (river, bspwm on some builds).
-    let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    parse_version(&text)
+    // Some print their version on stderr (river, bspwm on some builds).
+    Some(format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
 }
 
 /// The first version-looking word: "GNOME Shell 47.1" -> "47.1",
@@ -715,6 +999,64 @@ mod tests {
             parse_nvidia_info("580.95.05, 98.03.3B.00.A8\n580.95.05, [N/A]\nNVIDIA-SMI has failed\n"),
             [("580.95.05".to_string(), Some("98.03.3B.00.A8".to_string())), ("580.95.05".to_string(), None)]
         );
+    }
+
+    #[test]
+    fn monitor_from_edid() {
+        // An LG 32GS95UE's EDID base block (serial numbers zeroed).
+        let mut b = vec![0u8; 128];
+        b[..8].copy_from_slice(&[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
+        b[8..12].copy_from_slice(&[0x1e, 0x6d, 0x46, 0x78]); // "GSM", product 0x7846
+        b[21] = 70;
+        b[22] = 39;
+        b[54..72].copy_from_slice(&[0x4d, 0xd0, 0x00, 0xa0, 0xf0, 0x70, 0x3e, 0x80, 0x30, 0x20, 0x35, 0x00, 0xb9, 0x88, 0x21, 0, 0, 0x1a]);
+        b[72..80].copy_from_slice(&[0, 0, 0, 0xfd, 0x0c, 0x30, 0xf0, 0xff]);
+        b[90..95].copy_from_slice(&[0, 0, 0, 0xfc, 0]);
+        b[95..108].copy_from_slice(b"LG ULTRAGEAR+");
+        let pnp = "GSL\tGeneral Standards\nGSM\tLG Electronics\n";
+        assert_eq!(describe_edid(&b, None, None, Some(pnp)).as_deref(), Some("LG ULTRAGEAR+ · 3840×2160 · max 240 Hz · 31.5″"));
+        assert_eq!(
+            describe_edid(&b, Some("2560×1440".into()), Some(143.998), None).as_deref(),
+            Some("GSM LG ULTRAGEAR+ · 2560×1440 · 144 Hz (max 240 Hz) · 31.5″")
+        );
+        // Laptop panel: no name or limits, only text; maker added in front.
+        b[72..108].fill(0);
+        b[90..95].copy_from_slice(&[0, 0, 0, 0xfe, 0]);
+        b[95..108].copy_from_slice(b"LP140WF7-SPH1");
+        assert_eq!(describe_edid(&b, None, None, Some(pnp)).as_deref(), Some("LG LP140WF7-SPH1 · 3840×2160 · 31.5″"));
+        assert_eq!(describe_edid(&b, None, Some(59.94), Some(pnp)).as_deref(), Some("LG LP140WF7-SPH1 · 3840×2160 · 59.94 Hz · 31.5″"));
+        assert_eq!(describe_edid(&b[..100], None, None, None), None, "truncated");
+        b[0] = 1;
+        assert_eq!(describe_edid(&b, None, None, None), None, "bad header");
+    }
+
+    #[test]
+    fn current_mode_from_xrandr() {
+        let edid = |id: u8| format!("00ffffffffffff00{id:02x}{}", "00".repeat(119));
+        let text = format!(
+            "Screen 0: minimum 8 x 8, current 6400 x 2160, maximum 32767 x 32767\n\
+             HDMI-0 disconnected (normal left inverted right x axis y axis)\n\
+             \tnon-desktop: 0 \n\
+             DP-4 connected primary 3840x2160+0+0 (normal left inverted right x axis y axis) 700mm x 390mm\n\
+             \tEDID: \n\t\t{}\n\t\t{}\n\
+             \tnon-desktop: 0 \n\t\tsupported: 0, 1\n\
+             \x20  3840x2160    240.08 + 144.05*   95.03    60.00  \n\
+             \x20  1920x1080    143.98   119.88    60.00    59.94  \n\
+             DP-5 connected 2560x1440+3840+0 (normal left inverted right x axis y axis) 600mm x 340mm\n\
+             \tEDID: \n\t\t{}\n\
+             \x20  2560x1440     59.95*+ 164.80  \n\
+             DP-6 connected (normal left inverted right x axis y axis)\n\
+             \tEDID: \n\t\t{}\n\
+             \x20  1920x1080     60.00 +\n",
+            &edid(1)[..128],
+            &edid(1)[128..],
+            edid(2),
+            edid(3),
+        );
+        let modes = parse_xrandr(&text);
+        assert_eq!(modes.len(), 2, "the switched-off DP-6 has no current mode");
+        assert_eq!((modes[0].0[8], modes[0].1), (1, (3840, 2160, 144.05)));
+        assert_eq!((modes[1].0[8], modes[1].1), (2, (2560, 1440, 59.95)));
     }
 
     #[test]
