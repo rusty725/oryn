@@ -181,16 +181,22 @@ impl GpuStats {
     }
 }
 
+/// A PCI address the way sysfs writes it: nvidia-smi's "00000000:01:00.0"
+/// has an 8-digit domain, sysfs's "0000:01:00.0" a 4-digit one.
+#[cfg(target_os = "linux")]
+fn sysfs_pci_addr(bus: &str) -> String {
+    let b = bus.to_lowercase();
+    match b.split_once(':') {
+        Some((dom, rest)) if dom.len() > 4 => format!("{}:{rest}", &dom[dom.len() - 4..]),
+        _ => b,
+    }
+}
+
 /// PCI device ID of the GPU at `bus` ("00000000:01:00.0" or "0000:01:00.0").
 #[cfg(target_os = "linux")]
 fn pci_device_id(bus: &str) -> Option<u16> {
-    let b = bus.to_lowercase();
-    let addr = match b.split_once(':') {
-        Some((dom, rest)) if dom.len() > 4 => format!("{}:{rest}", &dom[dom.len() - 4..]),
-        _ => b,
-    };
     let root = crate::env_os("SYSFS").unwrap_or_else(|| "/".into());
-    let p = std::path::Path::new(&root).join("sys/bus/pci/devices").join(addr).join("device");
+    let p = std::path::Path::new(&root).join("sys/bus/pci/devices").join(sysfs_pci_addr(bus)).join("device");
     let v = std::fs::read_to_string(p).ok()?;
     u16::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()
 }
@@ -538,14 +544,7 @@ mod nv_hwmon {
     /// nvidia-smi). Sensors without a PCI link are used only when there is a
     /// single NVIDIA GPU, so they can't be attached to the wrong card.
     pub fn read(extras: &[Extra], bus: &str, only_gpu: bool) -> (Option<f32>, Option<f32>) {
-        // nvidia-smi uses an 8-digit domain; sysfs uses 4.
-        let want = {
-            let b = bus.to_lowercase();
-            match b.split_once(':') {
-                Some((dom, rest)) if dom.len() > 4 => format!("{}:{rest}", &dom[dom.len() - 4..]),
-                _ => b,
-            }
-        };
+        let want = super::sysfs_pci_addr(bus);
         let mine = extras.iter().filter(|e| match &e.pci {
             Some(p) => *p == want,
             None => only_gpu,

@@ -92,6 +92,19 @@ fn parse_line(line: &str) -> Option<(usize, Gpu)> {
     ))
 }
 
+/// Start `nvidia-smi --query-gpu=<fields> -lms <ms>`, printing CSV lines.
+fn spawn_stream(fields: &str, ms: &str) -> Option<(std::process::Child, std::process::ChildStdout)> {
+    let mut child = Command::new(exe())
+        .args([&format!("--query-gpu={fields}"), "--format=csv,noheader,nounits", "-lms", ms])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    Some((child, stdout))
+}
+
 /// Per-GPU thresholds from `nvidia-smi -q -d TEMPERATURE`, in GPU order.
 /// Looks for "GPU Slowdown Temp : 87 C" and "Memory Max Operating Temp : 95 C".
 fn parse_limits(text: &str) -> Vec<(Option<f32>, Option<f32>)> {
@@ -126,25 +139,11 @@ impl NvidiaPoller {
         let gpus: Arc<Mutex<Vec<Gpu>>> = Arc::new(Mutex::new(Vec::new()));
         let stopped = Arc::new(Mutex::new(None));
         let ms = interval.as_millis().clamp(200, 10_000).to_string();
-
-        let spawn = |fields: &str| {
-            Command::new(exe())
-                .args([&format!("--query-gpu={fields}"), "--format=csv,noheader,nounits", "-lms", &ms])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .stdin(Stdio::null())
-                .spawn()
-                .ok()
-        };
-        let mut child = spawn(FIELDS)?;
-        let stdout = child.stdout.take()?;
-        let ms2 = ms.clone();
+        let (mut child, mut stdout) = spawn_stream(FIELDS, &ms)?;
 
         let (g, s) = (Arc::clone(&gpus), Arc::clone(&stopped));
         thread::spawn(move || {
             let mut latest: HashMap<usize, Gpu> = HashMap::new();
-            let mut stdout = stdout;
-            let mut child = child;
             let mut tried_basic = false;
             loop {
                 let mut got_any = false;
@@ -165,22 +164,25 @@ impl NvidiaPoller {
                 // Retry once with temperatures only.
                 if !got_any && !tried_basic {
                     tried_basic = true;
-                    let next = Command::new(exe())
-                        .args([&format!("--query-gpu={FIELDS_BASIC}"), "--format=csv,noheader,nounits", "-lms", &ms2])
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::null())
-                        .stdin(Stdio::null())
-                        .spawn();
-                    if let Ok(mut c) = next
-                        && let Some(out) = c.stdout.take() {
-                            stdout = out;
-                            child = c;
-                            continue;
-                        }
+                    if let Some((c, out)) = spawn_stream(FIELDS_BASIC, &ms) {
+                        (child, stdout) = (c, out);
+                        continue;
+                    }
                 }
                 break;
             }
             // nvidia-smi exited (driver reload, GPU fell off the bus, …).
+            // Keep the cards listed, but drop their last figures so the GPU
+            // panel and header don't keep showing them as if live.
+            for gpu in g.lock().unwrap().iter_mut() {
+                *gpu = Gpu {
+                    name: std::mem::take(&mut gpu.name),
+                    bus: std::mem::take(&mut gpu.bus),
+                    slowdown: gpu.slowdown,
+                    mem_max: gpu.mem_max,
+                    ..Default::default()
+                };
+            }
             *s.lock().unwrap() = Some("nvidia-smi stopped".into());
         });
         let _ = SHARED.set(Arc::clone(&gpus));

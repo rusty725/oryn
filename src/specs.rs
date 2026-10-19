@@ -878,8 +878,8 @@ fn parse_version(text: &str) -> Option<String> {
     })
 }
 
-/// NVIDIA driver version, if nvidia-smi is installed.
-/// (driver version, VBIOS version) per NVIDIA GPU, in nvidia-smi's order.
+/// (driver version, VBIOS version) per NVIDIA GPU, in nvidia-smi's order,
+/// if nvidia-smi is installed.
 fn nvidia_info() -> Vec<(String, Option<String>)> {
     let exe = crate::env_str("NVIDIA_SMI").unwrap_or_else(|| "nvidia-smi".into());
     let Ok(out) = std::process::Command::new(exe)

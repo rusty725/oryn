@@ -118,7 +118,6 @@ impl SmartPoller {
         {
             // Fill in model / rotational from sysfs (works without root), and
             // list SATA disks even when smartctl is missing, with a hint.
-            let known: HashSet<String> = disks.iter().map(|d| d.path.clone()).collect();
             for (name, model, rot) in linux_sata_disks() {
                 let path = format!("/dev/{name}");
                 if skip.contains(&path) {
@@ -127,7 +126,7 @@ impl SmartPoller {
                 if let Some(d) = disks.iter_mut().find(|d| d.path == path) {
                     d.model = d.model.take().or(model);
                     d.rotational = rot;
-                } else if !have_smartctl && !known.contains(&path) {
+                } else if !have_smartctl {
                     let mut d = Disk::new(path, None);
                     d.model = model;
                     d.rotational = rot;

@@ -129,20 +129,12 @@ fn parse_panels(spec: &str) -> Option<[bool; NP]> {
     Some(show)
 }
 
-fn compact_file() -> Option<std::path::PathBuf> {
-    Some(themes::config_dir()?.join("compact"))
-}
-
 fn load_compact() -> bool {
-    compact_file().and_then(|p| std::fs::read_to_string(p).ok()).is_some_and(|s| s.trim() == "on")
+    themes::read_config("compact").is_some_and(|s| s.trim() == "on")
 }
 
 fn save_compact(on: bool) {
     themes::write_config("compact", if on { "on\n" } else { "off\n" });
-}
-
-fn panels_file() -> Option<std::path::PathBuf> {
-    Some(themes::config_dir()?.join("panels"))
 }
 
 /// User-arranged panel order and columns (the `v` menu: Ctrl+Shift+↑/↓, ←/→).
@@ -183,7 +175,7 @@ impl PanelLayout {
 }
 
 fn load_panels() -> Option<([bool; NP], PanelLayout)> {
-    parse_saved(&std::fs::read_to_string(panels_file()?).ok()?)
+    parse_saved(&themes::read_config("panels")?)
 }
 
 /// The saved file lists every panel in display order, hidden ones with a
@@ -238,11 +230,11 @@ fn parse_saved(text: &str) -> Option<([bool; NP], PanelLayout)> {
 }
 
 fn save_panels(show: &[bool; NP], lay: &PanelLayout) {
-    themes::write_config("panels", &format!("{}\n", panels_text(show, lay)));
+    themes::write_config("panels", &format!("{}\n", format_saved(show, lay)));
 }
 
-/// "sensors:L,-history:L,cpu:R,…": every panel in order, with its column.
-fn panels_text(show: &[bool; NP], lay: &PanelLayout) -> String {
+/// The text `parse_saved` reads back.
+fn format_saved(show: &[bool; NP], lay: &PanelLayout) -> String {
     let parts: Vec<String> = lay
         .order
         .iter()
@@ -1640,7 +1632,7 @@ fn layout(app: &App, body: Rect) -> Vec<(Slot, Rect)> {
                 let mut rest = right.clone();
                 let moved = rest.remove(i);
                 fix_tail(&mut rest);
-                if rest.last().is_some_and(&stretchy) {
+                if rest.last().is_some_and(stretchy) {
                     left.push(moved);
                     right = rest;
                     ok = true;
@@ -1714,7 +1706,7 @@ fn layout(app: &App, body: Rect) -> Vec<(Slot, Rect)> {
                     if last { Constraint::Min(h) } else { Constraint::Length(h) }
                 }
                 Slot::MemDisks => {
-                    let h = panels::disks_height(app.stats.disks.len()).min(14).max(panels::MEM_HEIGHT);
+                    let h = panels::disks_height(app.stats.disks.len()).clamp(panels::MEM_HEIGHT, 14);
                     if last { Constraint::Min(h) } else { Constraint::Length(h) }
                 }
                 Slot::Panel(P_MEM) => {
@@ -2641,7 +2633,7 @@ mod tests {
         lay.move_by(P_PROC, -10); // processes to the top
         lay.left[P_CPU] = true; // CPU into the left column
         let show = [true, false, true, true, true, true, true, true, false];
-        let (s2, l2) = parse_saved(&panels_text(&show, &lay)).unwrap();
+        let (s2, l2) = parse_saved(&format_saved(&show, &lay)).unwrap();
         assert_eq!(s2, show);
         assert_eq!(l2, lay);
         assert_eq!(l2.order[0], P_PROC);

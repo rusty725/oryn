@@ -356,7 +356,7 @@ fn hsl(h: f32, s: f32, l: f32) -> Color {
 /// Oryn used to be called tempmon: if `oryn` doesn't exist yet but the old
 /// `tempmon` folder does, its settings (theme, panels, layout, compact mode)
 /// are copied over once, so nothing is lost. The old folder is left alone.
-pub fn config_dir() -> Option<std::path::PathBuf> {
+fn config_dir() -> Option<std::path::PathBuf> {
     // Under `sudo oryn` (needed for SMART and the RTX 50 hotspot), use the
     // invoking user's settings rather than root's, so the theme and layout
     // you chose are the ones you get.
@@ -457,12 +457,13 @@ pub fn write_config(name: &str, contents: &str) {
     }
 }
 
-fn config_file() -> Option<std::path::PathBuf> {
-    Some(config_dir()?.join("theme"))
+/// Read one settings file, if it exists.
+pub fn read_config(name: &str) -> Option<String> {
+    std::fs::read_to_string(config_dir()?.join(name)).ok()
 }
 
 pub fn load_saved() -> Option<usize> {
-    find(std::fs::read_to_string(config_file()?).ok()?.trim())
+    find(read_config("theme")?.trim())
 }
 
 pub fn save(idx: usize) {

@@ -85,17 +85,16 @@ you can show, hide and rearrange.
 ## Installation
 
 The [releases](https://github.com/rusty725/oryn/releases) have
-ready-made packages for x86_64 (64-bit Intel/AMD): the Linux ones below are
-from [v0.1.11](https://github.com/rusty725/oryn/releases/tag/v0.1.11), the
-FreeBSD ones from [v0.1.12](https://github.com/rusty725/oryn/releases/tag/v0.1.12).
+ready-made packages for x86_64 (64-bit Intel/AMD): the Linux and FreeBSD
+ones below are from [v0.1.12](https://github.com/rusty725/oryn/releases/tag/v0.1.12).
 On other machines (aarch64…), [build from source](#any-linux-distribution-from-source).
 
 | Package | For |
 |---------|-----|
-| `oryn-0.1.11-1-x86_64.pkg.tar.zst` | Arch Linux, CachyOS, EndeavourOS, Manjaro |
-| `oryn_0.1.11-1_amd64.deb` | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS |
-| `oryn-0.1.11-1.x86_64.rpm` | Fedora, RHEL / Rocky / Alma 9+, openSUSE |
-| `oryn-0.1.11-x86_64-linux.tar.gz` | any other x86_64 Linux with glibc 2.34+ |
+| `oryn-0.1.12-1-x86_64.pkg.tar.zst` | Arch Linux, CachyOS, EndeavourOS, Manjaro |
+| `oryn_0.1.12-1_amd64.deb` | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS |
+| `oryn-0.1.12-1.x86_64.rpm` | Fedora, RHEL / Rocky / Alma 9+, openSUSE |
+| `oryn-0.1.12-x86_64-linux.tar.gz` | any other x86_64 Linux with glibc 2.34+ |
 | `oryn-0.1.12-freebsd-amd64.pkg` | FreeBSD 15 (amd64), installed with `pkg` |
 | `oryn-0.1.12-amd64-freebsd.tar.gz` | FreeBSD 15 (amd64): binary, man page and instructions |
 
@@ -107,8 +106,8 @@ run `sha256sum -c --ignore-missing SHA256SUMS`.
 ### Arch Linux, CachyOS, Manjaro
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.11/oryn-0.1.11-1-x86_64.pkg.tar.zst
-sudo pacman -U oryn-0.1.11-1-x86_64.pkg.tar.zst
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.12/oryn-0.1.12-1-x86_64.pkg.tar.zst
+sudo pacman -U oryn-0.1.12-1-x86_64.pkg.tar.zst
 sudo pacman -S --needed --asdeps smartmontools hwdata   # optional extras
 ```
 
@@ -124,8 +123,8 @@ makepkg -si
 ### Debian, Ubuntu, Linux Mint, Pop!_OS
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.11/oryn_0.1.11-1_amd64.deb
-sudo apt install ./oryn_0.1.11-1_amd64.deb
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.12/oryn_0.1.12-1_amd64.deb
+sudo apt install ./oryn_0.1.12-1_amd64.deb
 sudo apt install smartmontools          # optional extra
 ```
 
@@ -135,8 +134,8 @@ in its repositories instead of the file.
 ### Fedora, RHEL, Rocky, AlmaLinux
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.11/oryn-0.1.11-1.x86_64.rpm
-sudo dnf install ./oryn-0.1.11-1.x86_64.rpm
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.12/oryn-0.1.12-1.x86_64.rpm
+sudo dnf install ./oryn-0.1.12-1.x86_64.rpm
 ```
 
 `dnf` also installs the recommended `smartmontools` and `hwdata`.
@@ -144,8 +143,8 @@ sudo dnf install ./oryn-0.1.11-1.x86_64.rpm
 ### openSUSE
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.11/oryn-0.1.11-1.x86_64.rpm
-sudo zypper install --allow-unsigned-rpm ./oryn-0.1.11-1.x86_64.rpm
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.12/oryn-0.1.12-1.x86_64.rpm
+sudo zypper install --allow-unsigned-rpm ./oryn-0.1.12-1.x86_64.rpm
 ```
 
 ### Any other Linux: the .tar.gz
@@ -154,9 +153,9 @@ A plain binary plus the man page, for distributions without a package
 above. Needs glibc 2.34 or newer (`ldd --version` shows yours).
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.11/oryn-0.1.11-x86_64-linux.tar.gz
-tar xzf oryn-0.1.11-x86_64-linux.tar.gz
-cd oryn-0.1.11-x86_64-linux
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.12/oryn-0.1.12-x86_64-linux.tar.gz
+tar xzf oryn-0.1.12-x86_64-linux.tar.gz
+cd oryn-0.1.12-x86_64-linux
 sudo install -Dm755 oryn /usr/local/bin/oryn
 sudo install -Dm644 oryn.1 /usr/local/share/man/man1/oryn.1
 ```

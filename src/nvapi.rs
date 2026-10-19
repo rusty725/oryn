@@ -22,7 +22,8 @@
 //! The register decoding (`read_registers`) works on any `Regs`; FreeBSD,
 //! which has no NvAPI, reads the same registers from a mapping of BAR0.
 
-#![allow(unsafe_op_in_unsafe_fn, dead_code)]
+#![allow(unsafe_op_in_unsafe_fn)]
+#![cfg_attr(target_os = "freebsd", allow(dead_code))]
 
 use std::ffi::{c_char, c_void, CStr};
 use std::mem::{size_of, transmute};

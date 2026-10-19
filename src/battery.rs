@@ -57,20 +57,18 @@ pub fn read_battery(root: &Path) -> Option<Battery> {
     dirs.sort();
 
     // Totals in µWh / µW when every battery reports energy, else in µAh / µA.
+    let energy = dirs.iter().all(|d| num(d, "energy_now").is_some() && num(d, "energy_full").is_some());
+    let (now_f, full_f, rate_f) =
+        if energy { ("energy_now", "energy_full", "power_now") } else { ("charge_now", "charge_full", "current_now") };
     let (mut now, mut full, mut rate, mut pcts) = (0.0, 0.0, 0.0, Vec::new());
-    let mut states = Vec::new();
+    let (mut counted, mut states) = (0, Vec::new());
     for d in &dirs {
-        let (n, f) = match (num(d, "energy_now"), num(d, "energy_full")) {
-            (Some(n), Some(f)) => (Some(n), Some(f)),
-            _ => (num(d, "charge_now"), num(d, "charge_full")),
-        };
-        if let (Some(n), Some(f)) = (n, f) {
+        if let (Some(n), Some(f)) = (num(d, now_f), num(d, full_f)) {
             now += n;
             full += f;
+            counted += 1;
         }
-        // Rate in the same unit as now/full: power for energy, current for charge.
-        let r = if d.join("energy_now").exists() { num(d, "power_now") } else { num(d, "current_now") };
-        rate += r.unwrap_or(0.0).abs();
+        rate += num(d, rate_f).unwrap_or(0.0).abs();
         if let Some(c) = num(d, "capacity") {
             pcts.push(c);
         }
@@ -82,7 +80,10 @@ pub fn read_battery(root: &Path) -> Option<Battery> {
             _ => State::Unknown,
         });
     }
-    let percent = if full > 0.0 {
+    // Totals that leave a battery out (one reports energy, another only
+    // charge) would be wrong; the drivers' own percentages are used then.
+    let whole = full > 0.0 && counted == dirs.len();
+    let percent = if whole {
         (now / full * 100.0).clamp(0.0, 100.0)
     } else if !pcts.is_empty() {
         pcts.iter().sum::<f64>() / pcts.len() as f64
@@ -102,7 +103,7 @@ pub fn read_battery(root: &Path) -> Option<Battery> {
         })
         .sum::<Option<f64>>()
         .filter(|w| *w > 0.05);
-    let hours_left = (rate > 0.0 && full > 0.0)
+    let hours_left = (rate > 0.0 && whole)
         .then(|| match state {
             State::Discharging => Some(now / rate),
             State::Charging => Some((full - now).max(0.0) / rate),
@@ -163,6 +164,16 @@ mod tests {
         supply(&tmp, "BAT1", &[("status", "Full"), ("charge_now", "4000000"), ("current_now", "0")]);
         let b = read_battery(&tmp).unwrap();
         assert_eq!((b.percent, b.state, b.watts, b.hours_left), (100.0, State::Full, None, None));
+
+        // Two batteries, one energy-based and one charge-based: µWh and µAh
+        // can't be added up, so the drivers' percentages are averaged.
+        supply(&tmp, "BAT1", &[("status", "Discharging"), ("capacity", "100"), ("current_now", "1000000")]);
+        supply(&tmp, "BAT0", &[
+            ("type", "Battery"), ("status", "Discharging"), ("capacity", "50"),
+            ("energy_now", "30000000"), ("energy_full", "60000000"), ("power_now", "10000000"),
+        ]);
+        let b = read_battery(&tmp).unwrap();
+        assert_eq!((b.percent, b.state, b.hours_left), (75.0, State::Discharging, None));
         let _ = fs::remove_dir_all(&tmp);
     }
 

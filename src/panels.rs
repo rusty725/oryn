@@ -10,6 +10,7 @@ use ratatui::{
     Frame,
 };
 
+use crate::ellipsize;
 use crate::sysstats::{human, human_bits, SysStats, HIST};
 use crate::themes::Theme;
 
@@ -44,6 +45,13 @@ fn meter(frac: f64, width: usize, color: Color, th: &Theme) -> Vec<Span<'static>
         Span::styled("■".repeat(n), Style::new().fg(color)),
         Span::styled("■".repeat(width - n), Style::new().fg(th.border)),
     ]
+}
+
+/// Top of a usage graph (percent): zoomed in when usage is low so small
+/// changes show, but never below 10 %.
+fn graph_top(hist: &std::collections::VecDeque<f32>) -> f64 {
+    let peak = hist.iter().copied().fold(0.0f32, f32::max);
+    if peak < 10.0 { 10.0 } else if peak < 25.0 { 25.0 } else if peak < 50.0 { 50.0 } else { 100.0 }
 }
 
 fn pct_of(part: u64, total: u64) -> f64 {
@@ -236,9 +244,7 @@ pub fn draw_cpu(
     let off = HIST.saturating_sub(s.cpu_hist.len());
     let pts: Vec<(f64, f64)> =
         s.cpu_hist.iter().enumerate().map(|(i, v)| ((i + off) as f64, *v as f64)).collect();
-    let peak = s.cpu_hist.iter().cloned().fold(0.0f32, f32::max);
-    // Zoom in when usage is low so small changes show, but never below 10 %.
-    let top = if peak < 10.0 { 10.0 } else if peak < 25.0 { 25.0 } else if peak < 50.0 { 50.0 } else { 100.0 };
+    let top = graph_top(&s.cpu_hist);
     let chart = Chart::new(vec![
         Dataset::default()
             .marker(symbols::Marker::Braille)
@@ -551,10 +557,7 @@ pub fn draw_procs(f: &mut Frame, area: Rect, s: &SysStats, th: &Theme, key: usiz
             bottom_status = Some(Span::styled(format!(" {msg} "), style));
         } else {
             b = b.title(
-                Line::from(Span::styled(
-                    format!(" {} ", ellipsize(msg, w.saturating_sub(2))),
-                    Style::new().fg(if *err { th.crit } else { th.ok }).add_modifier(Modifier::BOLD),
-                ))
+                Line::from(Span::styled(format!(" {} ", ellipsize(msg, w.saturating_sub(2))), style))
                 .right_aligned(),
             );
         }
@@ -767,16 +770,6 @@ fn action_bar(pv: &ProcView, th: &Theme, width: usize) -> Line<'static> {
     line
 }
 
-fn ellipsize(s: &str, w: usize) -> String {
-    if s.chars().count() <= w {
-        s.to_string()
-    } else if w == 0 {
-        String::new()
-    } else {
-        s.chars().take(w - 1).chain(std::iter::once('…')).collect()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // GPU
 // ---------------------------------------------------------------------------
@@ -867,8 +860,7 @@ fn draw_one_gpu(f: &mut Frame, area: Rect, g: &crate::gpustats::GpuView, show_na
     // Usage history, same zooming line graph as the CPU panel.
     let off = HIST.saturating_sub(g.hist.len());
     let pts: Vec<(f64, f64)> = g.hist.iter().enumerate().map(|(i, v)| ((i + off) as f64, *v as f64)).collect();
-    let peak = g.hist.iter().cloned().fold(0.0f32, f32::max);
-    let top = if peak < 10.0 { 10.0 } else if peak < 25.0 { 25.0 } else if peak < 50.0 { 50.0 } else { 100.0 };
+    let top = graph_top(&g.hist);
     let chart = Chart::new(vec![
         Dataset::default()
             .marker(symbols::Marker::Braille)

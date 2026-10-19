@@ -1,6 +1,6 @@
 pkgbase = oryn
 	pkgdesc = Terminal hardware monitor: every temperature sensor plus btop-style CPU, GPU, memory, disk, network and process panels
-	pkgver = 0.1.11
+	pkgver = 0.1.12
 	pkgrel = 1
 	url = https://github.com/rusty725/oryn
 	arch = x86_64
@@ -18,7 +18,7 @@ pkgbase = oryn
 	optdepends = smartmontools: temperatures of SATA/USB drives without the drivetemp driver
 	optdepends = nvidia-utils: NVIDIA GPU temperatures, usage, VRAM, hotspot and VRAM chips
 	optdepends = hwdata: readable names for PCI devices (GPUs, network cards, USB controllers)
-	source = oryn-0.1.11.tar.gz::https://github.com/rusty725/oryn/archive/refs/tags/v0.1.11.tar.gz
+	source = oryn-0.1.12.tar.gz::https://github.com/rusty725/oryn/archive/refs/tags/v0.1.12.tar.gz
 	sha256sums = SKIP
 
 pkgname = oryn

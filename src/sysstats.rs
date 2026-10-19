@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use sysinfo::{
-    CpuRefreshKind, DiskRefreshKind, Disks, MemoryRefreshKind, Networks, Pid,
+    CpuRefreshKind, DiskRefreshKind, Disks, MemoryRefreshKind, Networks,
     ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind, Users,
 };
 
@@ -403,15 +403,12 @@ impl SysStats {
         // desktop the memory crept up over time.
         let kind = ProcessRefreshKind::nothing()
             .without_tasks()
+            .with_cpu()
             .with_memory()
             .with_cmd(UpdateKind::OnlyIfNotSet)
             .with_user(UpdateKind::OnlyIfNotSet);
         let _guard = libc_buffers();
-        self.sys.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            kind.with_cpu(),
-        );
+        self.sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
         let users = &self.users;
         let names = &mut self.user_names;
         let mut list: Vec<ProcInfo> = self
@@ -443,13 +440,13 @@ impl SysStats {
                     .collect::<Vec<_>>()
                     .join(" ");
                 ProcInfo {
-                    pid: pid_u32(pid),
+                    pid: pid.as_u32(),
                     name: p.name().to_string_lossy().to_string(),
                     cmd: if cmd.is_empty() { format!("[{}]", p.name().to_string_lossy()) } else { cmd },
                     user,
                     mem: p.memory(),
                     cpu: p.cpu_usage(),
-                    nice: crate::procctl::nice_of(pid_u32(pid)),
+                    nice: crate::procctl::nice_of(pid.as_u32()),
                 }
             })
             .collect();
@@ -556,14 +553,10 @@ pub fn libc_buffers() -> impl Drop {
 fn sort_procs(list: &mut [ProcInfo], by: ProcSort) {
     match by {
         ProcSort::Cpu => list.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(b.mem.cmp(&a.mem))),
-        ProcSort::Mem => list.sort_by(|a, b| b.mem.cmp(&a.mem)),
+        ProcSort::Mem => list.sort_by_key(|p| std::cmp::Reverse(p.mem)),
         ProcSort::Pid => list.sort_by_key(|p| p.pid),
         ProcSort::Name => list.sort_by_key(|a| a.name.to_lowercase()),
     }
-}
-
-fn pid_u32(pid: &Pid) -> u32 {
-    pid.as_u32()
 }
 
 fn push<T>(h: &mut VecDeque<T>, v: T) {

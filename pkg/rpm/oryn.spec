@@ -8,7 +8,7 @@
 %global _docdir_fmt %{name}
 
 Name:           oryn
-Version:        0.1.11
+Version:        0.1.12
 Release:        1%{?dist}
 Summary:        Terminal hardware monitor with every temperature sensor
 
@@ -57,6 +57,13 @@ install -Dm0644 doc/oryn.1 %{buildroot}%{_mandir}/man1/oryn.1
 %{_mandir}/man1/oryn.1*
 
 %changelog
+* Sun Oct 18 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.12-1
+- GPU panel and header no longer show the last NVIDIA figures as live after
+  nvidia-smi stops.
+- Battery: laptops with two batteries that report in different units show
+  a correct charge.
+- Smaller, tidier code with no change in behavior.
+
 * Sun Oct 18 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.11-1
 - Specs panel: the RAM Timings line is removed; the Speed line still shows
   the speed in use and the sticks' XMP/EXPO rating.
