@@ -994,6 +994,7 @@ fn main() -> io::Result<()> {
              --theme <name>  color scheme, e.g. dracula, nord, tokyo-night\n\
              --themes        list the available color schemes\n\
              --gpu-info      explain which GPU temperatures (VRAM, hotspot) can be read\n\
+             --ram-info      explain what was read for RAM names, speed and timings (FreeBSD)\n\
              --mem-probe     check which part of Oryn, if any, keeps memory (no UI, ~1 min)\n\
              --version       print the version\n\
              --compact       start in compact mode (temperatures only; `c` toggles)\n\
@@ -1014,6 +1015,13 @@ fn main() -> io::Result<()> {
         print!("{}", gpustats::gpu_info_report());
         #[cfg(not(target_os = "linux"))]
         println!("--gpu-info is Linux-only.");
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--ram-info") {
+        #[cfg(target_os = "freebsd")]
+        print!("{}", freebsd::ram_report());
+        #[cfg(not(target_os = "freebsd"))]
+        println!("--ram-info is FreeBSD-only.");
         return Ok(());
     }
     if args.iter().any(|a| a == "-V" || a == "--version") {

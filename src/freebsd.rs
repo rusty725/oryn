@@ -705,27 +705,35 @@ impl RamSource {
 }
 
 /// Maker and part number from the SPD EEPROM behind an SPD5118 hub; its
-/// timings are handed to `devnames::note_spd` for the specs panel. The
-/// EEPROM is read in 128-byte pages through the hub's legacy mode: MR11
-/// selects the page, registers 0x80–0xFF are its bytes. MR11 is put back.
+/// timings are handed to `devnames::note_spd` for the specs panel.
 fn spd5118_name(dev: &std::fs::File, addr: u8) -> Option<String> {
+    let spd = spd5118_read(dev, addr).ok()?;
+    crate::devnames::note_spd(&spd);
+    crate::devnames::parse_spd(&spd)
+}
+
+/// The parts of the SPD EEPROM behind an SPD5118 hub that Oryn uses (the
+/// rest stays 0), or why it couldn't be read. The EEPROM is read in
+/// 128-byte pages through the hub's legacy mode: MR11 selects the page,
+/// registers 0x80–0xFF are its bytes. MR11 is put back.
+fn spd5118_read(dev: &std::fs::File, addr: u8) -> Result<Vec<u8>, String> {
     use crate::devnames::{SPD_EXPO, SPD_XMP};
-    let saved = smb_read(dev, addr, MR_LEGACY_PAGE)?;
+    let saved = smb_read(dev, addr, MR_LEGACY_PAGE).ok_or("MR11 (page select) unreadable")?;
     if saved & 0x08 != 0 {
-        return None; // two-byte addressing: not what legacy reads expect
+        return Err(format!("MR11 = {saved:#04x}: two-byte addressing, not legacy mode"));
     }
     let mut spd = vec![0u8; 1024];
     let mut page = None;
-    let mut read = |spd: &mut [u8], bytes: std::ops::Range<usize>| -> Option<()> {
+    let mut read = |spd: &mut [u8], bytes: std::ops::Range<usize>| -> Result<(), String> {
         for i in bytes {
             let p = (i / 128) as u8;
             if page != Some(p) {
-                smb_write(dev, addr, MR_LEGACY_PAGE, (saved & !0x07) | p)?;
+                smb_write(dev, addr, MR_LEGACY_PAGE, (saved & !0x07) | p).ok_or(format!("selecting page {p} refused"))?;
                 page = Some(p);
             }
-            spd[i] = smb_read(dev, addr, 0x80 | (i % 128) as u8)?;
+            spd[i] = smb_read(dev, addr, 0x80 | (i % 128) as u8).ok_or(format!("SPD byte {i} unreadable"))?;
         }
-        Some(())
+        Ok(())
     };
     // Bytes 0–47: memory type and JEDEC timings. 512–550: maker id and part
     // number. The XMP (640–831) and EXPO (832–959) blocks only if present.
@@ -743,12 +751,81 @@ fn spd5118_name(dev: &std::fs::File, addr: u8) -> Option<String> {
                 read(&mut spd, SPD_EXPO + 4..SPD_EXPO + 128)?;
             }
         }
-        Some(())
+        Ok(())
     })();
     let _ = smb_write(dev, addr, MR_LEGACY_PAGE, saved);
-    ok?;
-    crate::devnames::note_spd(&spd);
-    crate::devnames::parse_spd(&spd)
+    ok.map(|_| spd)
+}
+
+/// `oryn --ram-info`: each step behind the RAM names, temperatures, speed and
+/// timings, and where it stops.
+pub fn ram_report() -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let loaded = |m: &str| sysctl_str(&format!("dev.{m}.0.%driver")).is_some();
+    let _ = writeln!(out, "SMBus: smbus driver {}, smb(4) {}", if loaded("smbus") { "loaded" } else { "not loaded" },
+        if loaded("smb") { "loaded" } else { "not loaded (sudo kldload smb)" });
+    for n in 0.. {
+        let Some(parent) = sysctl_str(&format!("dev.smb.{n}.%parent")) else { break };
+        // smb0 on smbus0 on the controller (intsmb0, amdsmb0, ichsmb0…).
+        let ctrl = parent.trim_start_matches("smbus").parse::<u32>().ok()
+            .and_then(|i| sysctl_str(&format!("dev.smbus.{i}.%parent")));
+        let desc = ctrl.as_deref().and_then(|c| {
+            let split = c.find(|ch: char| ch.is_ascii_digit())?;
+            sysctl_str(&format!("dev.{}.{}.%desc", &c[..split], &c[split..]))
+        });
+        let _ = writeln!(out, "/dev/smb{n}: on {parent} on {} ({})", ctrl.as_deref().unwrap_or("?"), desc.as_deref().unwrap_or("?"));
+        let dev = match std::fs::File::options().read(true).write(true).open(format!("/dev/smb{n}")) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = writeln!(out, "  can't open: {e}{}", if crate::nvapi::is_root() { "" } else { " (run with sudo)" });
+                continue;
+            }
+        };
+        for addr in 0x50..=0x57u8 {
+            let id = (smb_read(&dev, addr, MR_DEVICE_TYPE), smb_read(&dev, addr, MR_DEVICE_TYPE + 1));
+            let _ = match id {
+                (None, None) => writeln!(out, "  {addr:#04x}: nothing"),
+                (Some(0x51), Some(0x18)) => match spd5118_read(&dev, addr) {
+                    Ok(spd) => {
+                        let _ = writeln!(out, "  {addr:#04x}: SPD5118 hub · memory type {:#04x}{} · {}", spd[2],
+                            if spd[2] == 0x12 { " (DDR5)" } else { "" },
+                            crate::devnames::parse_spd(&spd).unwrap_or_else(|| "no name".into()));
+                        let _ = writeln!(out, "        {}", crate::devnames::spd_block_status(&spd));
+                        let sets = crate::devnames::spd_timings(&spd);
+                        if sets.is_empty() {
+                            let _ = writeln!(out, "        no timings decoded");
+                        }
+                        for t in &sets {
+                            let _ = writeln!(out, "        {} {} MT/s: CL{}-{}-{}-{}", t.profile, t.mts, t.cl, t.rcd, t.rp, t.ras);
+                        }
+                        crate::devnames::note_spd(&spd);
+                        Ok(())
+                    }
+                    Err(e) => writeln!(out, "  {addr:#04x}: SPD5118 hub, SPD read failed: {e}"),
+                },
+                (a, b) => writeln!(out, "  {addr:#04x}: not an SPD5118 hub (MR0/MR1 = {a:02x?} {b:02x?})"),
+            };
+        }
+    }
+    let entries = smbios_entries(17);
+    let _ = writeln!(out, "SMBIOS memory devices: {}", match &entries {
+        Some(e) => format!("{} entries from /dev/mem", e.len()),
+        None => format!("/dev/mem not readable{}", if crate::nvapi::is_root() { "" } else { " (run with sudo)" }),
+    });
+    let dmi = match entries {
+        Some(e) if !e.is_empty() => crate::devnames::dmi_ram(&e),
+        _ => {
+            let d = dmidecode_memory();
+            let _ = writeln!(out, "  dmidecode fallback: {}", if d.is_some() { "ok" } else { "not available" });
+            d.unwrap_or_default()
+        }
+    };
+    let _ = writeln!(out, "  sticks: {:?}", dmi.sticks);
+    let _ = writeln!(out, "  speed: {} (MT/s for timings: {:?})", dmi.speed.as_deref().unwrap_or("unknown"), dmi.mts);
+    let _ = writeln!(out, "Timings shown in specs: {}", crate::devnames::ram_timings_text(dmi.mts)
+        .unwrap_or_else(|| "none (no SPD profile at that speed, or speed unknown)".into()));
+    out
 }
 
 impl Source for RamSource {

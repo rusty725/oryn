@@ -367,9 +367,7 @@ pub fn spd_timings(b: &[u8]) -> Vec<SpdTimings> {
             ras: clocks(t[3])?,
         })
     };
-    let crc_ok = |start: usize, len: usize| {
-        b.get(start..start + len).is_some_and(|blk| crc16_xmodem(&blk[..len - 2]) == u16::from_le_bytes([blk[len - 2], blk[len - 1]]))
-    };
+    let crc_ok = |start, len| block_crc_ok(b, start, len);
     let mut out = Vec::new();
     if b.get(SPD_EXPO..SPD_EXPO + 4) == Some(b"EXPO") && crc_ok(SPD_EXPO, 128) {
         for p in [SPD_EXPO + 10, SPD_EXPO + 50] {
@@ -386,6 +384,35 @@ pub fn spd_timings(b: &[u8]) -> Vec<SpdTimings> {
     }
     out.extend(timings("JEDEC", 20, [30, 32, 34, 36]));
     out
+}
+
+/// Whether the `len`-byte block at `start` ends in the CRC of the rest.
+fn block_crc_ok(b: &[u8], start: usize, len: usize) -> bool {
+    b.get(start..start + len).is_some_and(|blk| crc16_xmodem(&blk[..len - 2]) == u16::from_le_bytes([blk[len - 2], blk[len - 1]]))
+}
+
+/// For `--ram-info`: which vendor blocks an SPD image has and whether their
+/// CRCs match ("XMP 3.0: absent · EXPO: present, CRC ok").
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+pub fn spd_block_status(b: &[u8]) -> String {
+    let crc = |ok| if ok { "CRC ok" } else { "CRC MISMATCH" };
+    let xmp = if b.get(SPD_XMP..SPD_XMP + 2) == Some(&[0x0C, 0x4A][..]) {
+        format!(
+            "present, header {}, enable bits {:#04x}, profile 1 {}, profile 2 {}",
+            crc(block_crc_ok(b, SPD_XMP, 64)),
+            b.get(SPD_XMP + 3).copied().unwrap_or(0),
+            crc(block_crc_ok(b, SPD_XMP + 64, 64)),
+            crc(block_crc_ok(b, SPD_XMP + 128, 64)),
+        )
+    } else {
+        "absent".into()
+    };
+    let expo = if b.get(SPD_EXPO..SPD_EXPO + 4) == Some(b"EXPO") {
+        format!("present, {}", crc(block_crc_ok(b, SPD_EXPO, 128)))
+    } else {
+        "absent".into()
+    };
+    format!("XMP 3.0: {xmp} · EXPO: {expo}")
 }
 
 /// CRC-16/XMODEM (poly 0x1021, init 0), which guards the XMP/EXPO blocks.
