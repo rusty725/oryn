@@ -827,62 +827,11 @@ impl Smn {
     }
 }
 
-/// AMD family from CPUID ("AuthenticAMD" only), e.g. 0x19 (Zen 3/4) or 0x1A (Zen 5).
-fn amd_family() -> Option<u32> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use std::arch::x86_64::__cpuid;
-        let (v, l1) = (__cpuid(0), __cpuid(1));
-        let vendor = [v.ebx, v.edx, v.ecx].iter().flat_map(|r| r.to_le_bytes()).collect::<Vec<u8>>();
-        if vendor != b"AuthenticAMD" {
-            return None;
-        }
-        let base = (l1.eax >> 8) & 0xF;
-        Some(if base == 0xF { base + ((l1.eax >> 20) & 0xFF) } else { base })
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    None
-}
-
-/// The primary timings (CL, tRCD, tRP, tRAS) the memory controller runs:
-/// the first populated channel's UMC registers, on Zen 4 / Zen 5 with DDR5.
-/// Channels are 1 << 20 apart; a channel is in use when bit 19 of 0x50DF0
-/// is clear and a DIMM is present (bit 0 of 0x50000 or 0x50008). Register
-/// layout as documented by ZenStates-Core (Dictionaries/DDR5Dictionary.cs,
-/// MemoryConfig.cs), which ZenTimings uses. Only reads.
+/// The timings the memory controller runs, read over SMN through /dev/pci.
 pub fn umc_timings() -> Result<(u32, [u32; 4]), String> {
-    match amd_family() {
-        Some(f) if f >= 0x19 => {}
-        _ => return Err("not an AMD Zen 4/5 CPU".into()),
-    }
+    crate::devnames::check_amd_zen4()?;
     let smn = Smn::open()?;
-    for ch in 0..12u32 {
-        let base = ch << 20;
-        let Some(ctrl) = smn.read(base | 0x50DF0) else { continue };
-        if ctrl == u32::MAX || ctrl & (1 << 19) != 0 {
-            continue;
-        }
-        let dimm = |off| smn.read(base | off).is_some_and(|v| v != u32::MAX && v & 1 == 1);
-        if !dimm(0x50000) && !dimm(0x50008) {
-            continue;
-        }
-        let (Some(a), Some(b)) = (smn.read(base | 0x50204), smn.read(base | 0x50208)) else {
-            return Err(format!("channel {ch}: timing registers unreadable"));
-        };
-        return decode_umc(a, b).map(|t| (ch, t)).ok_or(format!("channel {ch}: implausible values {a:#010x} {b:#010x}"));
-    }
-    Err("no populated memory channel found".into())
-}
-
-/// CL, tRCD (read), tRP, tRAS from UMC registers 0x50204 and 0x50208.
-fn decode_umc(r204: u32, r208: u32) -> Option<[u32; 4]> {
-    if r204 == u32::MAX || r208 == u32::MAX {
-        return None; // what an absent register reads as
-    }
-    let bits = |v: u32, hi: u32, lo: u32| (v >> lo) & ((1 << (hi - lo + 1)) - 1);
-    let t = [bits(r204, 5, 0), bits(r204, 21, 16), bits(r208, 21, 16), bits(r204, 14, 8)];
-    let ok = t[..3].iter().all(|v| (8..=80).contains(v)) && (16..=127).contains(&t[3]);
-    ok.then_some(t)
+    crate::devnames::umc_timings_via(|addr| smn.read(addr))
 }
 
 /// `oryn --ram-info`: each step behind the RAM names, temperatures, speed and
@@ -1460,12 +1409,12 @@ mod tests {
         // 0x50208: RPpb 29:24, RP 21:16, RCpb 15:8, RC 7:0.
         let r204 = (36 << 24) | (38 << 16) | (76 << 8) | 32;
         let r208 = (38 << 24) | (38 << 16) | (114 << 8) | 114;
-        assert_eq!(decode_umc(r204, r208), Some([32, 38, 38, 76]));
-        assert_eq!(decode_umc(u32::MAX, u32::MAX), None); // unreadable
-        assert_eq!(decode_umc(0, 0), None);
+        assert_eq!(crate::devnames::decode_umc(r204, r208), Some([32, 38, 38, 76]));
+        assert_eq!(crate::devnames::decode_umc(u32::MAX, u32::MAX), None); // unreadable
+        assert_eq!(crate::devnames::decode_umc(0, 0), None);
         // This machine's CPU, when it's AMD.
         if cpu_model().is_some_and(|m| m.contains("AMD")) {
-            assert!(amd_family().is_some_and(|f| f >= 0x17));
+            assert!(crate::devnames::amd_family().is_some_and(|f| f >= 0x17));
         }
     }
 

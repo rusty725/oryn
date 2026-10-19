@@ -910,14 +910,21 @@ impl App {
         if dimms.iter().all(|d| d.starts_with("RAM DIMM")) && !dmi.sticks.is_empty() {
             dimms = dmi.sticks.clone();
         }
+        // The timings in use, from AMD's memory controller (DDR5 on Zen 4/5;
+        // root and the kernel's SMN debugfs). Read once, here.
+        #[cfg(target_os = "linux")]
+        if dmi.speed.as_deref().is_some_and(|s| s.starts_with("DDR5"))
+            && let Ok((_, t)) = devnames::umc_timings_linux(std::path::Path::new(
+                &crate::env_os("SYSFS").unwrap_or_else(|| "/".into()),
+            ))
+        {
+            devnames::note_current_timings(t);
+        }
         // Then the timings for that speed, from the sticks' SPD chips.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        let ram_speed = match (dmi.speed, devnames::ram_timings_text(dmi.mts)) {
-            (Some(s), Some(t)) => Some(format!("{s} · {t}")),
-            (s, t) => s.or(t),
-        };
+        let (ram_speed, ram_timings) = (devnames::ram_speed_line(dmi.speed, dmi.mts), devnames::ram_timings_text(dmi.mts));
         #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-        let ram_speed: Option<String> = None;
+        let (ram_speed, ram_timings): (Option<String>, Option<String>) = (None, None);
         let sys = sysinfo::System::new_with_specifics(
             sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()),
         );
@@ -928,6 +935,7 @@ impl App {
             &gpus,
             &dimms,
             ram_speed.as_deref(),
+            ram_timings.as_deref(),
         );
         self.specs = Some((s, gpus.len()));
     }

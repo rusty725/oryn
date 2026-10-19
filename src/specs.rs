@@ -44,7 +44,8 @@ fn human_size(bytes: f64) -> String {
 impl Specs {
     /// `gpus` from the GPU panel; `dimms`: RAM stick names from the sensors;
     /// `cpu_name` from sysinfo.
-    /// `ram_speed`: "DDR5 · 6000 MT/s" from SMBIOS, when readable.
+    /// `ram_speed`: "DDR5 · 6000 MT/s" from SMBIOS, when readable;
+    /// `ram_timings`: "CL30-38-38-76 in use · XMP CL32-39-39-102 @ 6400".
     pub fn collect(
         cpu_name: &str,
         threads: usize,
@@ -52,6 +53,7 @@ impl Specs {
         gpus: &[GpuSpec],
         dimms: &[String],
         ram_speed: Option<&str>,
+        ram_timings: Option<&str>,
     ) -> Self {
         use sysinfo::System;
         let r = root();
@@ -182,10 +184,9 @@ impl Specs {
                 .collect();
             ram.push_str(&format!(" · {}", sticks.join(", ")));
         }
-        if let Some(s) = ram_speed {
-            ram.push_str(&format!(" · {s}"));
-        }
         add("RAM", "RAM", ram);
+        add("Speed", "RAM", ram_speed.unwrap_or_default().to_string());
+        add("Timings", "RAM", ram_timings.unwrap_or_default().to_string());
 
         // Drives: model, size, type.
         let mut drives: Vec<(String, f64, &'static str, Option<String>)> = fs::read_dir(r.join("sys/block"))

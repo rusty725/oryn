@@ -438,7 +438,7 @@ Like btop, every panel can be shown or hidden:
 | 6   | net     | download/upload graph, speeds, totals (`n` = next interface) |
 | 7   | proc    | processes: scroll, filter, start, terminate, kill, nice (see [Process list](#process-list)) |
 | 8   | gpu     | GPU usage, VRAM, temperatures, power, fan, clocks, VRAM chips |
-| 9   | specs   | OS, kernel, host, uptime, board/BIOS, CPU, GPU (with VBIOS version), monitors with current and maximum refresh rate ("DP-3 · LG ULTRAGEAR+ · 3840×2160 · 144 Hz (max 240 Hz) · 31.5″"), RAM sticks, drives (with firmware version), network adapters with model and driver ("Realtek RTL8126 5GbE Controller · r8169 driver"), desktop with its version ("KDE Plasma 6.2.4 · Wayland"), shell, terminal |
+| 9   | specs   | OS, kernel, host, uptime, board/BIOS, CPU, GPU (with VBIOS version), monitors with current and maximum refresh rate ("DP-3 · LG ULTRAGEAR+ · 3840×2160 · 144 Hz (max 240 Hz) · 31.5″"), RAM sticks, RAM speed and timings, in use and as the XMP/EXPO profile rates them ("DDR5 · 6000 MT/s · XMP 6400 MT/s", "CL30-38-38-76 in use · XMP CL32-39-39-102 @ 6400"), drives (with firmware version), network adapters with model and driver ("Realtek RTL8126 5GbE Controller · r8169 driver"), desktop with its version ("KDE Plasma 6.2.4 · Wayland"), shell, terminal |
 
 ### Arranging panels
 
@@ -551,6 +551,19 @@ systems means running as root (`sudo oryn`). Without it, sticks show as
 board (most laptops) has no SPD chip; the specs panel then lists the modules
 the BIOS reports (SMBIOS type 17), which also needs root. GPU names need
 `pci.ids` (package `hwdata` or `pciutils`).
+
+The specs panel's **Speed** line shows the speed the BIOS set and the
+sticks' top XMP/EXPO rating ("DDR5 · 6000 MT/s · XMP 6400 MT/s"; the
+speed needs root). The **Timings** line shows the timings the memory
+controller runs, then the rated ones ("CL30-38-38-76 in use · XMP
+CL32-39-39-102 @ 6400"). The ones in use are read on AMD Zen 4/5 with DDR5, when Oryn runs
+as root on a kernel booted with the `amd_smn_debugfs_enable` option (Linux
+6.14+; add it to the kernel command line, e.g. in `/etc/default/grub` or
+your boot loader entry). The kernel keeps the memory controller's registers
+to itself otherwise, and Oryn doesn't go around it. Without that, the
+timings come from the sticks' SPD: the profile for the speed the memory
+runs at ("CL32-39-39-102 (XMP)"), or, when the speed was set by hand, only
+the stick's top rating ("XMP CL32-39-39-102 @ 6400 (rated)").
 
 ## GPU temperatures
 
