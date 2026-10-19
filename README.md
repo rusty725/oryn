@@ -13,9 +13,9 @@ you can show, hide and rearrange.
 
 <sub>Screenshot: `oryn --demo` on Linux in the Tokyo Night scheme, with simulated sensors and load.</sub>
 
-![Oryn on FreeBSD 15.1 with a Ryzen 9 9950X3D and an RTX 5080](docs/screenshot-freebsd.png)
+![Oryn on FreeBSD 15.1 in the Everblush color scheme, with a Ryzen 9 9950X3D and an RTX 5080](docs/screenshot-freebsd.png)
 
-<sub>Screenshot: `sudo oryn` on FreeBSD 15.1 (Ryzen 9 9950X3D, RTX 5080, DDR5, NVMe and SATA drives), real sensors.</sub>
+<sub>Screenshot: `sudo oryn` on FreeBSD 15.1 in the Everblush scheme (Ryzen 9 9950X3D, RTX 5080, DDR5, NVMe and SATA drives), real sensors.</sub>
 
 ## Features
 
