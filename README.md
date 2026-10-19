@@ -87,7 +87,7 @@ you can show, hide and rearrange.
 The [releases](https://github.com/rusty725/oryn/releases) have
 ready-made packages for x86_64 (64-bit Intel/AMD): the Linux ones below are
 from [v0.1.11](https://github.com/rusty725/oryn/releases/tag/v0.1.11), the
-FreeBSD ones from [v0.1.8](https://github.com/rusty725/oryn/releases/tag/v0.1.8).
+FreeBSD ones from [v0.1.12](https://github.com/rusty725/oryn/releases/tag/v0.1.12).
 On other machines (aarch64…), [build from source](#any-linux-distribution-from-source).
 
 | Package | For |
@@ -96,8 +96,8 @@ On other machines (aarch64…), [build from source](#any-linux-distribution-from
 | `oryn_0.1.11-1_amd64.deb` | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS |
 | `oryn-0.1.11-1.x86_64.rpm` | Fedora, RHEL / Rocky / Alma 9+, openSUSE |
 | `oryn-0.1.11-x86_64-linux.tar.gz` | any other x86_64 Linux with glibc 2.34+ |
-| `oryn-0.1.8-freebsd-amd64.pkg` | FreeBSD 15 (amd64), installed with `pkg` |
-| `oryn-0.1.8-amd64-freebsd.tar.gz` | FreeBSD 15 (amd64): binary, man page and instructions |
+| `oryn-0.1.12-freebsd-amd64.pkg` | FreeBSD 15 (amd64), installed with `pkg` |
+| `oryn-0.1.12-amd64-freebsd.tar.gz` | FreeBSD 15 (amd64): binary, man page and instructions |
 
 Each package installs the `oryn` command and its man page (`man oryn`).
 The commands below download the file into the current folder and install
@@ -181,16 +181,16 @@ cargo install --locked --git https://github.com/rusty725/oryn
 Built on FreeBSD 15.1-RELEASE (amd64). With the package:
 
 ```sh
-fetch https://github.com/rusty725/oryn/releases/download/v0.1.8/oryn-0.1.8-freebsd-amd64.pkg
-sudo pkg add ./oryn-0.1.8-freebsd-amd64.pkg
+fetch https://github.com/rusty725/oryn/releases/download/v0.1.12/oryn-0.1.12-freebsd-amd64.pkg
+sudo pkg add ./oryn-0.1.12-freebsd-amd64.pkg
 ```
 
 Or with the .tar.gz:
 
 ```sh
-fetch https://github.com/rusty725/oryn/releases/download/v0.1.8/oryn-0.1.8-amd64-freebsd.tar.gz
-tar xzf oryn-0.1.8-amd64-freebsd.tar.gz
-cd oryn-0.1.8-amd64-freebsd
+fetch https://github.com/rusty725/oryn/releases/download/v0.1.12/oryn-0.1.12-amd64-freebsd.tar.gz
+tar xzf oryn-0.1.12-amd64-freebsd.tar.gz
+cd oryn-0.1.12-amd64-freebsd
 sudo install -m 755 oryn /usr/local/bin/oryn
 sudo install -m 644 oryn.1 /usr/local/share/man/man1/oryn.1
 ```
@@ -213,6 +213,7 @@ so the package installs nothing else. These are optional and add readings:
 | `smartmontools` package | SATA drive temperatures, SMART data | `pkg install smartmontools` |
 | `dmidecode` package | RAM model and speed without root (with a sudoers rule) | `pkg install dmidecode` |
 | `nvidia-driver` package | NVIDIA GPU panel (`nvidia-smi`) | `pkg install nvidia-driver` |
+| `xrandr` package | Monitor lines in the specs panel (X11) | `pkg install xrandr` |
 
 NVMe temperatures, the drive list, board and BIOS details need nothing
 extra (NVMe health needs root).

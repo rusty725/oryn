@@ -20,6 +20,7 @@ adds readings.
      sudo pkg install smartmontools        # SATA/NVMe SMART temperatures
      sudo pkg install dmidecode            # RAM model and speed without root
      sudo pkg install nvidia-driver        # NVIDIA GPU panel (nvidia-smi)
+     sudo pkg install xrandr               # monitors in the specs panel (X11)
 
 4. Run it
 
