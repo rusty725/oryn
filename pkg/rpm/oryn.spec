@@ -8,7 +8,7 @@
 %global _docdir_fmt %{name}
 
 Name:           oryn
-Version:        0.1.9
+Version:        0.1.10
 Release:        1%{?dist}
 Summary:        Terminal hardware monitor with every temperature sensor
 
@@ -57,6 +57,11 @@ install -Dm0644 doc/oryn.1 %{buildroot}%{_mandir}/man1/oryn.1
 %{_mandir}/man1/oryn.1*
 
 %changelog
+* Sun Oct 18 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.10-1
+- Specs panel: RAM Speed and Timings lines, with the timings the memory
+  controller runs (AMD Zen 4/5 with DDR5) next to the sticks' rated
+  XMP/EXPO profile.
+
 * Sun Oct 18 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.9-1
 - Specs panel: RAM speed and timings from the sticks' SPD (JEDEC, EXPO,
   XMP 3.0) and the BIOS.
