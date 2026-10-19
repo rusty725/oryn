@@ -438,15 +438,21 @@ pub fn note_spd(b: &[u8]) {
 }
 
 /// "CL30-36-36-76 (EXPO)": the timings for the speed the memory runs at
-/// (`mts`, from SMBIOS). None when no SPD profile matches that speed (for
-/// example tuned by hand), since the SPD can't say what was set instead.
+/// (`mts`, from SMBIOS). When no SPD profile is for that speed (set by hand
+/// in the BIOS), the stick's own top rating instead, marked as such:
+/// "rated CL32-39-39-102 @ 6400 (XMP)"; the SPD can't say what was set.
 pub fn ram_timings_text(mts: Option<u32>) -> Option<String> {
-    timings_for(&SPD_TIMINGS.lock().unwrap(), mts?)
+    timings_for(&SPD_TIMINGS.lock().unwrap(), mts)
 }
 
-fn timings_for(sets: &[SpdTimings], mts: u32) -> Option<String> {
-    let t = sets.iter().find(|t| t.mts.abs_diff(mts) <= 50)?;
-    Some(format!("CL{}-{}-{}-{} ({})", t.cl, t.rcd, t.rp, t.ras, t.profile))
+fn timings_for(sets: &[SpdTimings], mts: Option<u32>) -> Option<String> {
+    let cl = |t: &SpdTimings| format!("CL{}-{}-{}-{}", t.cl, t.rcd, t.rp, t.ras);
+    if let Some(t) = mts.and_then(|m| sets.iter().find(|t| t.mts.abs_diff(m) <= 50)) {
+        return Some(format!("{} ({})", cl(t), t.profile));
+    }
+    // Highest speed; on a tie the first (EXPO before XMP before JEDEC).
+    let t = sets.iter().rev().max_by_key(|t| t.mts)?;
+    Some(format!("rated {} @ {} ({})", cl(t), t.mts, t.profile))
 }
 
 /// Each installed memory module as the BIOS describes it (SMBIOS type 17,
@@ -777,10 +783,13 @@ mod tests {
         let expo = SpdTimings { profile: "EXPO", mts: 6000, cl: 30, rcd: 36, rp: 36, ras: 76 };
         let jedec = SpdTimings { profile: "JEDEC", mts: 4800, cl: 40, rcd: 39, rp: 39, ras: 77 };
         assert_eq!(t, vec![expo, jedec]);
-        // The speed SMBIOS reports picks the set; a hand-tuned speed gets none.
-        assert_eq!(timings_for(&t, 6000).as_deref(), Some("CL30-36-36-76 (EXPO)"));
-        assert_eq!(timings_for(&t, 4800).as_deref(), Some("CL40-39-39-77 (JEDEC)"));
-        assert_eq!(timings_for(&t, 6400), None);
+        // The speed SMBIOS reports picks the set; a hand-set speed gets the
+        // stick's top rating, marked as rated.
+        assert_eq!(timings_for(&t, Some(6000)).as_deref(), Some("CL30-36-36-76 (EXPO)"));
+        assert_eq!(timings_for(&t, Some(4800)).as_deref(), Some("CL40-39-39-77 (JEDEC)"));
+        assert_eq!(timings_for(&t, Some(6400)).as_deref(), Some("rated CL30-36-36-76 @ 6000 (EXPO)"));
+        assert_eq!(timings_for(&t, None).as_deref(), Some("rated CL30-36-36-76 @ 6000 (EXPO)"));
+        assert_eq!(timings_for(&[], Some(6000)), None);
         // A corrupted EXPO block (CRC mismatch) is ignored.
         let mut bad = b.clone();
         bad[SPD_EXPO + 20] ^= 1;

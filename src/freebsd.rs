@@ -824,7 +824,7 @@ pub fn ram_report() -> String {
     let _ = writeln!(out, "  sticks: {:?}", dmi.sticks);
     let _ = writeln!(out, "  speed: {} (MT/s for timings: {:?})", dmi.speed.as_deref().unwrap_or("unknown"), dmi.mts);
     let _ = writeln!(out, "Timings shown in specs: {}", crate::devnames::ram_timings_text(dmi.mts)
-        .unwrap_or_else(|| "none (no SPD profile at that speed, or speed unknown)".into()));
+        .unwrap_or_else(|| "none (no SPD timings read)".into()));
     out
 }
 
