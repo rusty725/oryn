@@ -269,8 +269,11 @@ fn dimm(dev: &Path) -> String {
         .and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
         .and_then(|n| n.split_once('-').map(|(_, a)| a.to_string()))
         .and_then(|a| u16::from_str_radix(&a, 16).ok());
-    if let Some(name) = spd_eeprom(dev).and_then(|b| parse_spd(&b)) {
-        return name;
+    if let Some(b) = spd_eeprom(dev) {
+        note_spd(&b);
+        if let Some(name) = parse_spd(&b) {
+            return name;
+        }
     }
     match addr {
         Some(a) => format!("RAM DIMM @0x{a:02x}"),
@@ -319,6 +322,106 @@ pub fn parse_spd(b: &[u8]) -> Option<String> {
     }
 }
 
+/// One set of rated primary timings from a DDR5 SPD: the JEDEC base timings
+/// or a vendor overclocking profile (AMD EXPO, Intel XMP 3.0).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpdTimings {
+    pub profile: &'static str,
+    /// Data rate the timings are for.
+    pub mts: u32,
+    pub cl: u32,
+    pub rcd: u32,
+    pub rp: u32,
+    pub ras: u32,
+}
+
+/// Start of the XMP 3.0 block (magic 0x0C 0x4A, enable bits at +3, then
+/// 64-byte header and profile blocks) and of the EXPO block ("EXPO", 10-byte
+/// header, 40-byte profiles, one CRC over the 128-byte block). Layouts as
+/// pinned by the spdr crate (JESD400-5 decoder, Apache-2.0) against
+/// memtest86plus and DDR5SPDEditor and confirmed by each block's CRC.
+pub const SPD_XMP: usize = 640;
+pub const SPD_EXPO: usize = 832;
+
+/// Every timing set a DDR5 SPD image holds, vendor profiles first. A vendor
+/// block counts only when its CRC matches, so a misread never shows up as
+/// timings.
+pub fn spd_timings(b: &[u8]) -> Vec<SpdTimings> {
+    if b.get(2) != Some(&0x12) {
+        return Vec::new(); // DDR5 only: other generations lay this out differently
+    }
+    let word = |off: usize| b.get(off..off + 2).map(|w| u16::from_le_bytes([w[0], w[1]]) as u32);
+    // tCK, then tAA, tRCD, tRP, tRAS (ps, little-endian) at the given offsets.
+    let timings = |profile, tck: usize, t: [usize; 4]| -> Option<SpdTimings> {
+        let tck = word(tck).filter(|c| (200..=1000).contains(c))?;
+        // ps to clocks: round up, with 30 ps of slack for tCK's own rounding
+        // (as JEDEC's algorithm and memtest86plus do); CL is always even.
+        let clocks = |off| word(off).filter(|v| *v > 0).map(|v| (v + tck - 30) / tck);
+        let cl = clocks(t[0])?;
+        Some(SpdTimings {
+            profile,
+            mts: (2_000_000 / tck + 50) / 100 * 100,
+            cl: cl + cl % 2,
+            rcd: clocks(t[1])?,
+            rp: clocks(t[2])?,
+            ras: clocks(t[3])?,
+        })
+    };
+    let crc_ok = |start: usize, len: usize| {
+        b.get(start..start + len).is_some_and(|blk| crc16_xmodem(&blk[..len - 2]) == u16::from_le_bytes([blk[len - 2], blk[len - 1]]))
+    };
+    let mut out = Vec::new();
+    if b.get(SPD_EXPO..SPD_EXPO + 4) == Some(b"EXPO") && crc_ok(SPD_EXPO, 128) {
+        for p in [SPD_EXPO + 10, SPD_EXPO + 50] {
+            out.extend(timings("EXPO", p + 4, [p + 6, p + 8, p + 10, p + 12]));
+        }
+    }
+    if b.get(SPD_XMP..SPD_XMP + 2) == Some(&[0x0C, 0x4A][..]) && crc_ok(SPD_XMP, 64) {
+        let enabled = b.get(SPD_XMP + 3).copied().unwrap_or(0);
+        for (i, p) in [SPD_XMP + 64, SPD_XMP + 128].into_iter().enumerate() {
+            if enabled & (1 << i) != 0 && crc_ok(p, 64) {
+                out.extend(timings("XMP", p + 5, [p + 13, p + 15, p + 17, p + 19]));
+            }
+        }
+    }
+    out.extend(timings("JEDEC", 20, [30, 32, 34, 36]));
+    out
+}
+
+/// CRC-16/XMODEM (poly 0x1021, init 0), which guards the XMP/EXPO blocks.
+fn crc16_xmodem(data: &[u8]) -> u16 {
+    data.iter().fold(0u16, |mut crc, &byte| {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 { (crc << 1) ^ 0x1021 } else { crc << 1 };
+        }
+        crc
+    })
+}
+
+/// Timings of the sticks read so far (their SPD is read while naming them,
+/// on Linux from sysfs, on FreeBSD over SMBus); kits share one set.
+static SPD_TIMINGS: std::sync::Mutex<Vec<SpdTimings>> = std::sync::Mutex::new(Vec::new());
+
+pub fn note_spd(b: &[u8]) {
+    let t = spd_timings(b);
+    if !t.is_empty() {
+        *SPD_TIMINGS.lock().unwrap() = t;
+    }
+}
+
+/// "CL30-36-36-76 (EXPO)": the timings for the speed the memory runs at
+/// (`mts`, from SMBIOS). None when no SPD profile matches that speed (for
+/// example tuned by hand), since the SPD can't say what was set instead.
+pub fn ram_timings_text(mts: Option<u32>) -> Option<String> {
+    timings_for(&SPD_TIMINGS.lock().unwrap(), mts?)
+}
+
+fn timings_for(sets: &[SpdTimings], mts: u32) -> Option<String> {
+    let t = sets.iter().find(|t| t.mts.abs_diff(mts) <= 50)?;
+    Some(format!("CL{}-{}-{}-{} ({})", t.cl, t.rcd, t.rp, t.ras, t.profile))
+}
+
 /// Each installed memory module as the BIOS describes it (SMBIOS type 17,
 /// `/sys/firmware/dmi/entries/17-*/raw`): "Samsung K3KL8L80CM-MGCT". This
 /// covers soldered memory (most laptops), which has no SPD chip to read.
@@ -343,16 +446,17 @@ pub struct DmiRam {
     pub sticks: Vec<String>,
     /// "DDR5 · 6000 MT/s", or "DDR5 · 4800 MT/s (rated 6000)".
     pub speed: Option<String>,
+    /// The speed it runs at in MT/s (configured, else rated).
+    pub mts: Option<u32>,
 }
 
 /// Names and speed from raw SMBIOS type 17 entries (formatted area plus strings).
 pub fn dmi_ram(entries: &[Vec<u8>]) -> DmiRam {
+    let speeds: Vec<_> = entries.iter().filter_map(|b| parse_dmi_speed(b)).collect();
     DmiRam {
         sticks: entries.iter().filter_map(|b| parse_dmi_memory(b)).collect(),
-        speed: entries
-            .iter()
-            .filter_map(|b| parse_dmi_speed(b))
-            .find_map(|(kind, configured, rated)| ram_speed_text(kind, configured, rated)),
+        speed: speeds.iter().find_map(|&(kind, configured, rated)| ram_speed_text(kind, configured, rated)),
+        mts: speeds.iter().find_map(|&(_, configured, rated)| configured.or(rated)),
     }
 }
 
@@ -617,5 +721,69 @@ mod tests {
             *x = b' ';
         }
         assert_eq!(parse_spd(&b).as_deref(), Some("Kingston KF560C36BBE-32"));
+    }
+
+    /// A DDR5 SPD: JEDEC 4800 40-39-39-77 in the base block, plus an
+    /// EXPO 6000 profile (30-36-36-76) with a valid block CRC.
+    fn ddr5_spd_image() -> Vec<u8> {
+        let mut b = vec![0u8; 1024];
+        b[2] = 0x12;
+        let put = |b: &mut Vec<u8>, off: usize, ps: u16| b[off..off + 2].copy_from_slice(&ps.to_le_bytes());
+        for (off, ps) in [(20, 416), (30, 16640), (32, 16000), (34, 16000), (36, 32000)] {
+            put(&mut b, off, ps);
+        }
+        b[SPD_EXPO..SPD_EXPO + 4].copy_from_slice(b"EXPO");
+        let p = SPD_EXPO + 10;
+        for (off, ps) in [(4, 333), (6, 10000), (8, 12000), (10, 12000), (12, 25300)] {
+            put(&mut b, p + off, ps);
+        }
+        let crc = crc16_xmodem(&b[SPD_EXPO..SPD_EXPO + 126]);
+        put(&mut b, SPD_EXPO + 126, crc);
+        b
+    }
+
+    #[test]
+    fn ddr5_timings_from_spd() {
+        assert_eq!(crc16_xmodem(b"123456789"), 0x31C3); // the XMODEM check value
+        let b = ddr5_spd_image();
+        let t = spd_timings(&b);
+        let expo = SpdTimings { profile: "EXPO", mts: 6000, cl: 30, rcd: 36, rp: 36, ras: 76 };
+        let jedec = SpdTimings { profile: "JEDEC", mts: 4800, cl: 40, rcd: 39, rp: 39, ras: 77 };
+        assert_eq!(t, vec![expo, jedec]);
+        // The speed SMBIOS reports picks the set; a hand-tuned speed gets none.
+        assert_eq!(timings_for(&t, 6000).as_deref(), Some("CL30-36-36-76 (EXPO)"));
+        assert_eq!(timings_for(&t, 4800).as_deref(), Some("CL40-39-39-77 (JEDEC)"));
+        assert_eq!(timings_for(&t, 6400), None);
+        // A corrupted EXPO block (CRC mismatch) is ignored.
+        let mut bad = b.clone();
+        bad[SPD_EXPO + 20] ^= 1;
+        assert_eq!(spd_timings(&bad).iter().map(|t| t.profile).collect::<Vec<_>>(), ["JEDEC"]);
+        // Not DDR5: nothing.
+        let mut ddr4 = b;
+        ddr4[2] = 0x0c;
+        assert!(spd_timings(&ddr4).is_empty());
+    }
+
+    #[test]
+    fn xmp_profile_needs_enable_bit_and_crcs() {
+        let mut b = ddr5_spd_image();
+        b[SPD_EXPO] = 0; // no EXPO
+        b[SPD_XMP] = 0x0C;
+        b[SPD_XMP + 1] = 0x4A;
+        let p = SPD_XMP + 64;
+        for (off, ps) in [(5, 312u16), (13, 10000), (15, 12500), (17, 12500), (19, 32000)] {
+            b[p + off..p + off + 2].copy_from_slice(&ps.to_le_bytes());
+        }
+        let seal = |b: &mut Vec<u8>, start: usize| {
+            let crc = crc16_xmodem(&b[start..start + 62]);
+            b[start + 62..start + 64].copy_from_slice(&crc.to_le_bytes());
+        };
+        seal(&mut b, SPD_XMP);
+        seal(&mut b, p);
+        assert_eq!(spd_timings(&b).len(), 1); // profile 1 not enabled: JEDEC only
+        b[SPD_XMP + 3] = 0x01;
+        seal(&mut b, SPD_XMP);
+        let xmp = SpdTimings { profile: "XMP", mts: 6400, cl: 32, rcd: 40, rp: 40, ras: 103 };
+        assert_eq!(spd_timings(&b)[0], xmp);
     }
 }

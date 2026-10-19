@@ -704,26 +704,50 @@ impl RamSource {
     }
 }
 
-/// Maker and part number from the SPD EEPROM behind an SPD5118 hub. The
+/// Maker and part number from the SPD EEPROM behind an SPD5118 hub; its
+/// timings are handed to `devnames::note_spd` for the specs panel. The
 /// EEPROM is read in 128-byte pages through the hub's legacy mode: MR11
 /// selects the page, registers 0x80–0xFF are its bytes. MR11 is put back.
 fn spd5118_name(dev: &std::fs::File, addr: u8) -> Option<String> {
+    use crate::devnames::{SPD_EXPO, SPD_XMP};
     let saved = smb_read(dev, addr, MR_LEGACY_PAGE)?;
     if saved & 0x08 != 0 {
         return None; // two-byte addressing: not what legacy reads expect
     }
     let mut spd = vec![0u8; 1024];
-    let mut read_page = |page: u8, bytes: std::ops::Range<usize>| -> Option<()> {
-        smb_write(dev, addr, MR_LEGACY_PAGE, (saved & !0x07) | page)?;
+    let mut page = None;
+    let mut read = |spd: &mut [u8], bytes: std::ops::Range<usize>| -> Option<()> {
         for i in bytes {
+            let p = (i / 128) as u8;
+            if page != Some(p) {
+                smb_write(dev, addr, MR_LEGACY_PAGE, (saved & !0x07) | p)?;
+                page = Some(p);
+            }
             spd[i] = smb_read(dev, addr, 0x80 | (i % 128) as u8)?;
         }
         Some(())
     };
-    // Byte 2: memory type. Bytes 512–550: maker id and part number (page 4).
-    let ok = read_page(0, 0..4).and_then(|_| read_page(4, 512..551));
+    // Bytes 0–47: memory type and JEDEC timings. 512–550: maker id and part
+    // number. The XMP (640–831) and EXPO (832–959) blocks only if present.
+    let ok = (|| {
+        read(&mut spd, 0..48)?;
+        read(&mut spd, 512..551)?;
+        if spd[2] == 0x12 {
+            // DDR5: the vendor profiles, if their magic is there.
+            read(&mut spd, SPD_XMP..SPD_XMP + 2)?;
+            if spd[SPD_XMP..SPD_XMP + 2] == [0x0C, 0x4A] {
+                read(&mut spd, SPD_XMP + 2..SPD_EXPO)?;
+            }
+            read(&mut spd, SPD_EXPO..SPD_EXPO + 4)?;
+            if &spd[SPD_EXPO..SPD_EXPO + 4] == b"EXPO" {
+                read(&mut spd, SPD_EXPO + 4..SPD_EXPO + 128)?;
+            }
+        }
+        Some(())
+    })();
     let _ = smb_write(dev, addr, MR_LEGACY_PAGE, saved);
     ok?;
+    crate::devnames::note_spd(&spd);
     crate::devnames::parse_spd(&spd)
 }
 
@@ -867,6 +891,9 @@ fn parse_dmidecode_memory(text: &str) -> crate::devnames::DmiRam {
         if ram.speed.is_none() {
             let kind = field("Type").filter(|t| t.contains("DDR"));
             ram.speed = crate::devnames::ram_speed_text(kind.as_deref(), mts("Configured Memory Speed"), mts("Speed"));
+        }
+        if ram.mts.is_none() {
+            ram.mts = mts("Configured Memory Speed").or_else(|| mts("Speed"));
         }
     }
     ram

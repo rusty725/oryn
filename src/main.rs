@@ -910,8 +910,12 @@ impl App {
         if dimms.iter().all(|d| d.starts_with("RAM DIMM")) && !dmi.sticks.is_empty() {
             dimms = dmi.sticks.clone();
         }
+        // Then the timings for that speed, from the sticks' SPD chips.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        let ram_speed = dmi.speed;
+        let ram_speed = match (dmi.speed, devnames::ram_timings_text(dmi.mts)) {
+            (Some(s), Some(t)) => Some(format!("{s} · {t}")),
+            (s, _) => s,
+        };
         #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
         let ram_speed: Option<String> = None;
         let sys = sysinfo::System::new_with_specifics(
