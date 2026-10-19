@@ -322,17 +322,13 @@ pub fn parse_spd(b: &[u8]) -> Option<String> {
     }
 }
 
-/// One set of rated primary timings from a DDR5 SPD: the JEDEC base timings
-/// or a vendor overclocking profile (AMD EXPO, Intel XMP 3.0).
+/// One speed rating from a DDR5 SPD: the JEDEC base profile or a vendor
+/// overclocking profile (AMD EXPO, Intel XMP 3.0).
 #[derive(Clone, Debug, PartialEq)]
-pub struct SpdTimings {
+pub struct SpdProfile {
     pub profile: &'static str,
-    /// Data rate the timings are for.
+    /// Data rate in MT/s.
     pub mts: u32,
-    pub cl: u32,
-    pub rcd: u32,
-    pub rp: u32,
-    pub ras: u32,
 }
 
 /// Start of the XMP 3.0 block (magic 0x0C 0x4A, enable bits at +3, then
@@ -343,46 +339,35 @@ pub struct SpdTimings {
 pub const SPD_XMP: usize = 640;
 pub const SPD_EXPO: usize = 832;
 
-/// Every timing set a DDR5 SPD image holds, vendor profiles first. A vendor
-/// block counts only when its CRC matches, so a misread never shows up as
-/// timings.
-pub fn spd_timings(b: &[u8]) -> Vec<SpdTimings> {
+/// Every speed profile a DDR5 SPD image holds, vendor profiles first. A
+/// vendor block counts only when its CRC matches, so a misread never shows
+/// up as a speed.
+pub fn spd_profiles(b: &[u8]) -> Vec<SpdProfile> {
     if b.get(2) != Some(&0x12) {
         return Vec::new(); // DDR5 only: other generations lay this out differently
     }
     let word = |off: usize| b.get(off..off + 2).map(|w| u16::from_le_bytes([w[0], w[1]]) as u32);
-    // tCK, then tAA, tRCD, tRP, tRAS (ps, little-endian) at the given offsets.
-    let timings = |profile, tck: usize, t: [usize; 4]| -> Option<SpdTimings> {
+    // tCK (ps, little-endian) at the given offset.
+    let profile = |profile, tck: usize| -> Option<SpdProfile> {
         let tck = word(tck).filter(|c| (200..=1000).contains(c))?;
-        // ps to clocks: round up, with 30 ps of slack for tCK's own rounding
-        // (as JEDEC's algorithm and memtest86plus do); CL is always even.
-        let clocks = |off| word(off).filter(|v| *v > 0).map(|v| (v + tck - 30) / tck);
-        let cl = clocks(t[0])?;
-        Some(SpdTimings {
-            profile,
-            mts: (2_000_000 / tck + 50) / 100 * 100,
-            cl: cl + cl % 2,
-            rcd: clocks(t[1])?,
-            rp: clocks(t[2])?,
-            ras: clocks(t[3])?,
-        })
+        Some(SpdProfile { profile, mts: (2_000_000 / tck + 50) / 100 * 100 })
     };
     let crc_ok = |start, len| block_crc_ok(b, start, len);
     let mut out = Vec::new();
     if b.get(SPD_EXPO..SPD_EXPO + 4) == Some(b"EXPO") && crc_ok(SPD_EXPO, 128) {
         for p in [SPD_EXPO + 10, SPD_EXPO + 50] {
-            out.extend(timings("EXPO", p + 4, [p + 6, p + 8, p + 10, p + 12]));
+            out.extend(profile("EXPO", p + 4));
         }
     }
     if b.get(SPD_XMP..SPD_XMP + 2) == Some(&[0x0C, 0x4A][..]) && crc_ok(SPD_XMP, 64) {
         let enabled = b.get(SPD_XMP + 3).copied().unwrap_or(0);
         for (i, p) in [SPD_XMP + 64, SPD_XMP + 128].into_iter().enumerate() {
             if enabled & (1 << i) != 0 && crc_ok(p, 64) {
-                out.extend(timings("XMP", p + 5, [p + 13, p + 15, p + 17, p + 19]));
+                out.extend(profile("XMP", p + 5));
             }
         }
     }
-    out.extend(timings("JEDEC", 20, [30, 32, 34, 36]));
+    out.extend(profile("JEDEC", 20));
     out
 }
 
@@ -393,7 +378,6 @@ fn block_crc_ok(b: &[u8], start: usize, len: usize) -> bool {
 
 /// For `--ram-info`: which vendor blocks an SPD image has and whether their
 /// CRCs match ("XMP 3.0: absent · EXPO: present, CRC ok").
-#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
 pub fn spd_block_status(b: &[u8]) -> String {
     let crc = |ok| if ok { "CRC ok" } else { "CRC MISMATCH" };
     let xmp = if b.get(SPD_XMP..SPD_XMP + 2) == Some(&[0x0C, 0x4A][..]) {
@@ -426,127 +410,66 @@ fn crc16_xmodem(data: &[u8]) -> u16 {
     })
 }
 
-/// AMD family from CPUID ("AuthenticAMD" only), e.g. 0x19 (Zen 3/4) or 0x1A (Zen 5).
-pub(crate) fn amd_family() -> Option<u32> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use std::arch::x86_64::__cpuid;
-        let (v, l1) = (__cpuid(0), __cpuid(1));
-        let vendor = [v.ebx, v.edx, v.ecx].iter().flat_map(|r| r.to_le_bytes()).collect::<Vec<u8>>();
-        if vendor != b"AuthenticAMD" {
-            return None;
-        }
-        let base = (l1.eax >> 8) & 0xF;
-        Some(if base == 0xF { base + ((l1.eax >> 20) & 0xFF) } else { base })
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    None
-}
-
-/// Err unless the CPU is AMD family 0x19 or later (Zen 4 / Zen 5, whose
-/// UMC register layout `umc_timings_via` knows).
-pub fn check_amd_zen4() -> Result<(), String> {
-    match amd_family() {
-        Some(f) if f >= 0x19 => Ok(()),
-        _ => Err("not an AMD Zen 4/5 CPU".into()),
-    }
-}
-
-/// Linux: the timings the memory controller runs, through the kernel's own
-/// SMN interface in debugfs (root, and the kernel booted with
-/// `amd_smn_debugfs_enable`). Writing `address` picks a register and reading
-/// `value` reads it under the kernel's lock. User space must not reach SMN
-/// through the host bridge's config space instead: since Linux 6.14 the
-/// kernel reserves it and taints itself on such writes. `value` is never
-/// written (that would write the register).
+/// Linux `oryn --ram-info`: each step behind the RAM names and speed, and
+/// where it stops.
 #[cfg(target_os = "linux")]
-pub fn umc_timings_linux(root: &Path) -> Result<(u32, [u32; 4]), String> {
-    check_amd_zen4()?;
-    let dir = root.join("sys/kernel/debug/x86/amd_smn");
-    if !dir.join("value").exists() {
-        return Err("no SMN debugfs (needs root and the amd_smn_debugfs_enable boot option)".into());
-    }
-    let once = |addr: u32| -> Option<u32> {
-        fs::write(dir.join("address"), format!("{addr:#x}")).ok()?;
-        let v = fs::read_to_string(dir.join("value")).ok()?;
-        u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()
-    };
-    // The address is shared by everyone using these files: a value only
-    // counts if two reads agree.
-    umc_timings_via(|addr| {
-        (0..3).find_map(|_| {
-            let a = once(addr)?;
-            (once(addr)? == a).then_some(a)
+pub fn ram_report(root: &Path) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let sudo = if crate::nvapi::is_root() { "" } else { " (run with sudo)" };
+
+    let mut chips: Vec<(String, PathBuf)> = fs::read_dir(root.join("sys/class/hwmon"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = read_trim(&e.path().join("name"))?;
+            matches!(name.as_str(), "spd5118" | "ee1004" | "jc42").then(|| (name, e.path()))
         })
-    })
-}
-
-/// The primary timings (CL, tRCD, tRP, tRAS) the memory controller runs:
-/// the first populated channel's UMC registers, on Zen 4 / Zen 5 with DDR5.
-/// Channels are 1 << 20 apart; a channel is in use when bit 19 of 0x50DF0
-/// is clear and a DIMM is present (bit 0 of 0x50000 or 0x50008). Register
-/// layout as documented by ZenStates-Core (Dictionaries/DDR5Dictionary.cs,
-/// MemoryConfig.cs), which ZenTimings uses. `read` reads one SMN register;
-/// nothing is written.
-pub fn umc_timings_via(read: impl Fn(u32) -> Option<u32>) -> Result<(u32, [u32; 4]), String> {
-    for ch in 0..12u32 {
-        let base = ch << 20;
-        let Some(ctrl) = read(base | 0x50DF0) else { continue };
-        if ctrl == u32::MAX || ctrl & (1 << 19) != 0 {
+        .collect();
+    chips.sort_by(|a, b| a.1.cmp(&b.1));
+    let _ = writeln!(out, "SPD chips: {}", if chips.is_empty() {
+        "none (soldered memory has none; otherwise load the spd5118 or ee1004 driver)".to_string()
+    } else {
+        format!("{} found", chips.len())
+    });
+    for (name, dir) in &chips {
+        let dev = dir.join("device");
+        let at = fs::canonicalize(&dev).ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string()));
+        let at = at.as_deref().unwrap_or("?");
+        let Some(spd) = spd_eeprom(&dev) else {
+            let _ = writeln!(out, "  {name} at {at}: SPD not readable{sudo}");
             continue;
-        }
-        let dimm = |off| read(base | off).is_some_and(|v| v != u32::MAX && v & 1 == 1);
-        if !dimm(0x50000) && !dimm(0x50008) {
-            continue;
-        }
-        let (Some(a), Some(b)) = (read(base | 0x50204), read(base | 0x50208)) else {
-            return Err(format!("channel {ch}: timing registers unreadable"));
         };
-        return decode_umc(a, b).map(|t| (ch, t)).ok_or(format!("channel {ch}: implausible values {a:#010x} {b:#010x}"));
+        let _ = writeln!(out, "  {name} at {at}: memory type {:#04x} · {}", spd[2], parse_spd(&spd).unwrap_or_else(|| "no name".into()));
+        let _ = writeln!(out, "        {}", spd_block_status(&spd));
+        for t in spd_profiles(&spd) {
+            let _ = writeln!(out, "        {} {} MT/s", t.profile, t.mts);
+        }
+        note_spd(&spd);
     }
-    Err("no populated memory channel found".into())
+
+    let dmi = dmi_memory(root);
+    let _ = writeln!(out, "SMBIOS memory devices: {}", if dmi.sticks.is_empty() && dmi.speed.is_none() {
+        format!("none read{sudo}")
+    } else {
+        format!("{} named", dmi.sticks.len())
+    });
+    let _ = writeln!(out, "  sticks: {:?}", dmi.sticks);
+    let _ = writeln!(out, "  speed: {}", dmi.speed.as_deref().unwrap_or("unknown"));
+    let _ = writeln!(out, "Speed shown in specs: {}", ram_speed_line(dmi.speed, dmi.mts).unwrap_or_else(|| "none".into()));
+    out
 }
 
-/// CL, tRCD (read), tRP, tRAS from UMC registers 0x50204 and 0x50208.
-pub(crate) fn decode_umc(r204: u32, r208: u32) -> Option<[u32; 4]> {
-    if r204 == u32::MAX || r208 == u32::MAX {
-        return None; // what an absent register reads as
-    }
-    let bits = |v: u32, hi: u32, lo: u32| (v >> lo) & ((1 << (hi - lo + 1)) - 1);
-    let t = [bits(r204, 5, 0), bits(r204, 21, 16), bits(r208, 21, 16), bits(r204, 14, 8)];
-    let ok = t[..3].iter().all(|v| (8..=80).contains(v)) && (16..=127).contains(&t[3]);
-    ok.then_some(t)
-}
-
-/// Timings of the sticks read so far (their SPD is read while naming them,
-/// on Linux from sysfs, on FreeBSD over SMBus); kits share one set.
-static SPD_TIMINGS: std::sync::Mutex<Vec<SpdTimings>> = std::sync::Mutex::new(Vec::new());
+/// Speed profiles of the sticks read so far (their SPD is read while naming
+/// them, on Linux from sysfs, on FreeBSD over SMBus); kits share one set.
+static SPD_PROFILES: std::sync::Mutex<Vec<SpdProfile>> = std::sync::Mutex::new(Vec::new());
 
 pub fn note_spd(b: &[u8]) {
-    let t = spd_timings(b);
+    let t = spd_profiles(b);
     if !t.is_empty() {
-        *SPD_TIMINGS.lock().unwrap() = t;
+        *SPD_PROFILES.lock().unwrap() = t;
     }
-}
-
-/// CL, tRCD, tRP, tRAS the memory controller is running, where it can be
-/// read (AMD's UMC: over /dev/pci on FreeBSD, SMN debugfs on Linux).
-static CURRENT_TIMINGS: std::sync::Mutex<Option<[u32; 4]>> = std::sync::Mutex::new(None);
-
-pub fn note_current_timings(t: [u32; 4]) {
-    *CURRENT_TIMINGS.lock().unwrap() = Some(t);
-}
-
-/// The specs panel's Timings line: what the memory runs, then what its
-/// top SPD profile (XMP or EXPO, else JEDEC) is rated for.
-///
-/// - memory controller readable: "CL30-38-38-76 in use · XMP CL32-39-39-102 @ 6400"
-/// - running at a profile's speed (`mts`, from SMBIOS): that profile's
-///   timings, "CL32-39-39-102 (XMP)"
-/// - otherwise (speed set by hand, or unknown): only the rating,
-///   "XMP CL32-39-39-102 @ 6400 (rated)"
-pub fn ram_timings_text(mts: Option<u32>) -> Option<String> {
-    timings_for(&SPD_TIMINGS.lock().unwrap(), *CURRENT_TIMINGS.lock().unwrap(), mts)
 }
 
 /// The specs panel's Speed line: the speed the BIOS set (`dmi_speed`,
@@ -554,38 +477,22 @@ pub fn ram_timings_text(mts: Option<u32>) -> Option<String> {
 /// "DDR5 · 6000 MT/s · XMP 6400 MT/s". Without SMBIOS (no root), the
 /// rating alone: "DDR5 · XMP 6400 MT/s (rated)".
 pub fn ram_speed_line(dmi_speed: Option<String>, mts: Option<u32>) -> Option<String> {
-    speed_for(&SPD_TIMINGS.lock().unwrap(), dmi_speed, mts)
+    speed_for(&SPD_PROFILES.lock().unwrap(), dmi_speed, mts)
 }
 
 /// Highest speed; on a tie the first (EXPO before XMP before JEDEC).
-fn top_profile(sets: &[SpdTimings]) -> Option<&SpdTimings> {
+fn top_profile(sets: &[SpdProfile]) -> Option<&SpdProfile> {
     sets.iter().rev().max_by_key(|t| t.mts)
 }
 
-fn timings_for(sets: &[SpdTimings], current: Option<[u32; 4]>, mts: Option<u32>) -> Option<String> {
-    let cl = |t: &SpdTimings| format!("CL{}-{}-{}-{}", t.cl, t.rcd, t.rp, t.ras);
-    let rated = top_profile(sets).map(|t| format!("{} {} @ {}", t.profile, cl(t), t.mts));
-    if let Some([c, rcd, rp, ras]) = current {
-        let in_use = format!("CL{c}-{rcd}-{rp}-{ras} in use");
-        return Some(match rated {
-            Some(r) => format!("{in_use} · {r}"),
-            None => in_use,
-        });
-    }
-    if let Some(t) = mts.and_then(|m| sets.iter().find(|t| t.mts.abs_diff(m) <= 50)) {
-        return Some(format!("{} ({})", cl(t), t.profile));
-    }
-    rated.map(|r| format!("{r} (rated)"))
-}
-
-fn speed_for(sets: &[SpdTimings], dmi_speed: Option<String>, mts: Option<u32>) -> Option<String> {
+fn speed_for(sets: &[SpdProfile], dmi_speed: Option<String>, mts: Option<u32>) -> Option<String> {
     let top = top_profile(sets);
     match (dmi_speed, top) {
         // Running at the top profile's speed: say which profile it is.
         (Some(s), Some(t)) if mts.is_some_and(|m| t.mts.abs_diff(m) <= 50) => Some(format!("{s} ({})", t.profile)),
         (Some(s), Some(t)) => Some(format!("{s} · {} {} MT/s", t.profile, t.mts)),
         (Some(s), None) => Some(s),
-        // SPD timings are only read from DDR5.
+        // SPD profiles are only read from DDR5.
         (None, Some(t)) => Some(format!("DDR5 · {} {} MT/s (rated)", t.profile, t.mts)),
         (None, None) => None,
     }
@@ -898,67 +805,30 @@ mod tests {
         let mut b = vec![0u8; 1024];
         b[2] = 0x12;
         let put = |b: &mut Vec<u8>, off: usize, ps: u16| b[off..off + 2].copy_from_slice(&ps.to_le_bytes());
-        for (off, ps) in [(20, 416), (30, 16640), (32, 16000), (34, 16000), (36, 32000)] {
-            put(&mut b, off, ps);
-        }
+        put(&mut b, 20, 416); // JEDEC tCK: 4800 MT/s
         b[SPD_EXPO..SPD_EXPO + 4].copy_from_slice(b"EXPO");
-        let p = SPD_EXPO + 10;
-        for (off, ps) in [(4, 333), (6, 10000), (8, 12000), (10, 12000), (12, 25300)] {
-            put(&mut b, p + off, ps);
-        }
+        put(&mut b, SPD_EXPO + 10 + 4, 333); // EXPO profile 1 tCK: 6000 MT/s
         let crc = crc16_xmodem(&b[SPD_EXPO..SPD_EXPO + 126]);
         put(&mut b, SPD_EXPO + 126, crc);
         b
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn umc_timings_from_the_first_populated_channel() {
-        use std::collections::HashMap;
-        // Channel 0 disabled (bit 19), channel 1 has no DIMM, channel 2 is in use.
-        let r204 = (36 << 24) | (38 << 16) | (76 << 8) | 32;
-        let r208 = (38 << 24) | (38 << 16) | (114 << 8) | 114;
-        let regs: HashMap<u32, u32> = HashMap::from([
-            (0x50DF0, 1 << 19),
-            (0x150DF0, 0),
-            (0x150000, 0),
-            (0x150008, 0),
-            (0x250DF0, 0),
-            (0x250000, 0),
-            (0x250008, 1),
-            (0x250204, r204),
-            (0x250208, r208),
-        ]);
-        let read = |a| Some(*regs.get(&a).unwrap_or(&u32::MAX));
-        assert_eq!(umc_timings_via(read), Ok((2, [32, 38, 38, 76])));
-        assert!(umc_timings_via(|_| Some(u32::MAX)).is_err(), "no channel");
-        assert_eq!(decode_umc(u32::MAX, u32::MAX), None);
-        assert_eq!(decode_umc(0, 0), None, "implausible");
-        // No debugfs files under a fake root: an error, not a guess.
-        #[cfg(target_os = "linux")]
-        if check_amd_zen4().is_ok() {
-            assert!(umc_timings_linux(Path::new("/nonexistent")).is_err());
-        }
+    fn ram_report_says_where_it_stops() {
+        let r = ram_report(Path::new("/nonexistent"));
+        assert!(r.starts_with("SPD chips: none"), "{r}");
+        assert!(r.contains("\nSpeed shown in specs: "), "{r}");
     }
 
     #[test]
-    fn ddr5_timings_from_spd() {
+    fn ddr5_profiles_from_spd() {
         assert_eq!(crc16_xmodem(b"123456789"), 0x31C3); // the XMODEM check value
         let b = ddr5_spd_image();
-        let t = spd_timings(&b);
-        let expo = SpdTimings { profile: "EXPO", mts: 6000, cl: 30, rcd: 36, rp: 36, ras: 76 };
-        let jedec = SpdTimings { profile: "JEDEC", mts: 4800, cl: 40, rcd: 39, rp: 39, ras: 77 };
+        let t = spd_profiles(&b);
+        let expo = SpdProfile { profile: "EXPO", mts: 6000 };
+        let jedec = SpdProfile { profile: "JEDEC", mts: 4800 };
         assert_eq!(t, vec![expo, jedec]);
-        // The speed SMBIOS reports picks the set; a hand-set speed gets the
-        // stick's top rating, marked as rated.
-        assert_eq!(timings_for(&t, None, Some(6000)).as_deref(), Some("CL30-36-36-76 (EXPO)"));
-        assert_eq!(timings_for(&t, None, Some(4800)).as_deref(), Some("CL40-39-39-77 (JEDEC)"));
-        assert_eq!(timings_for(&t, None, Some(5600)).as_deref(), Some("EXPO CL30-36-36-76 @ 6000 (rated)"));
-        assert_eq!(timings_for(&t, None, None).as_deref(), Some("EXPO CL30-36-36-76 @ 6000 (rated)"));
-        assert_eq!(timings_for(&[], None, Some(6000)), None);
-        // Read from the memory controller: in use, then the rating.
-        let tuned = Some([28, 36, 36, 68]);
-        assert_eq!(timings_for(&t, tuned, Some(5600)).as_deref(), Some("CL28-36-36-68 in use · EXPO CL30-36-36-76 @ 6000"));
-        assert_eq!(timings_for(&[], tuned, None).as_deref(), Some("CL28-36-36-68 in use"));
         // Speed: what the BIOS set, then the top profile's when different.
         let dmi = |s: &str| Some(s.to_string());
         assert_eq!(speed_for(&t, dmi("DDR5 · 6000 MT/s"), Some(6000)).as_deref(), Some("DDR5 · 6000 MT/s (EXPO)"));
@@ -969,11 +839,11 @@ mod tests {
         // A corrupted EXPO block (CRC mismatch) is ignored.
         let mut bad = b.clone();
         bad[SPD_EXPO + 20] ^= 1;
-        assert_eq!(spd_timings(&bad).iter().map(|t| t.profile).collect::<Vec<_>>(), ["JEDEC"]);
+        assert_eq!(spd_profiles(&bad).iter().map(|t| t.profile).collect::<Vec<_>>(), ["JEDEC"]);
         // Not DDR5: nothing.
         let mut ddr4 = b;
         ddr4[2] = 0x0c;
-        assert!(spd_timings(&ddr4).is_empty());
+        assert!(spd_profiles(&ddr4).is_empty());
     }
 
     #[test]
@@ -983,19 +853,16 @@ mod tests {
         b[SPD_XMP] = 0x0C;
         b[SPD_XMP + 1] = 0x4A;
         let p = SPD_XMP + 64;
-        for (off, ps) in [(5, 312u16), (13, 10000), (15, 12500), (17, 12500), (19, 32000)] {
-            b[p + off..p + off + 2].copy_from_slice(&ps.to_le_bytes());
-        }
+        b[p + 5..p + 7].copy_from_slice(&312u16.to_le_bytes()); // tCK: 6400 MT/s
         let seal = |b: &mut Vec<u8>, start: usize| {
             let crc = crc16_xmodem(&b[start..start + 62]);
             b[start + 62..start + 64].copy_from_slice(&crc.to_le_bytes());
         };
         seal(&mut b, SPD_XMP);
         seal(&mut b, p);
-        assert_eq!(spd_timings(&b).len(), 1); // profile 1 not enabled: JEDEC only
+        assert_eq!(spd_profiles(&b).len(), 1); // profile 1 not enabled: JEDEC only
         b[SPD_XMP + 3] = 0x01;
         seal(&mut b, SPD_XMP);
-        let xmp = SpdTimings { profile: "XMP", mts: 6400, cl: 32, rcd: 40, rp: 40, ras: 103 };
-        assert_eq!(spd_timings(&b)[0], xmp);
+        assert_eq!(spd_profiles(&b)[0], SpdProfile { profile: "XMP", mts: 6400 });
     }
 }

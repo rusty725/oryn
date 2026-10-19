@@ -667,7 +667,6 @@ impl RamSource {
         let mut buses = Vec::new();
         let mut dimms = Vec::new();
         let mut note = None;
-        let mut ddr5 = false;
         let has_smbus = sysctl_str("dev.smbus.0.%driver").is_some();
         for n in 0.. {
             if sysctl_str(&format!("dev.smb.{n}.%driver")).is_none() {
@@ -693,11 +692,10 @@ impl RamSource {
                     (Some(lo), Some(hi)) => Some(spd5118_temp(lo, hi)).filter(|c| *c > 30.0 && *c < 150.0),
                     _ => None,
                 };
-                // Maker and part number; the SPD's rated timings go to the specs panel.
+                // Maker and part number; the SPD's rated speeds go to the specs panel.
                 let spd = spd5118_read(&dev, addr).ok();
                 if let Some(s) = &spd {
                     crate::devnames::note_spd(s);
-                    ddr5 |= s[2] == 0x12;
                 }
                 let model = spd
                     .as_deref()
@@ -706,11 +704,6 @@ impl RamSource {
                 dimms.push(Dimm { bus: buses.len(), addr, model, critical: crit });
             }
             buses.push(dev);
-        }
-        // The timings in use, from the memory controller (read once, here,
-        // before sampling starts).
-        if ddr5 && let Ok((_, t)) = umc_timings() {
-            crate::devnames::note_current_timings(t);
         }
         if dimms.is_empty() && note.is_none() && has_smbus && sysctl_str("dev.smb.0.%driver").is_none() {
             note = Some("kldload smb");
@@ -742,7 +735,7 @@ fn spd5118_read(dev: &std::fs::File, addr: u8) -> Result<Vec<u8>, String> {
         }
         Ok(())
     };
-    // Bytes 0–47: memory type and JEDEC timings. 512–550: maker id and part
+    // Bytes 0–47: memory type and JEDEC speed. 512–550: maker id and part
     // number. The XMP (640–831) and EXPO (832–959) blocks only if present.
     let ok = (|| {
         read(&mut spd, 0..48)?;
@@ -764,78 +757,8 @@ fn spd5118_read(dev: &std::fs::File, addr: u8) -> Result<Vec<u8>, String> {
     ok.map(|_| spd)
 }
 
-// ---------------------------------------------------------------------------
-// Current RAM timings from AMD's memory controller
-// ---------------------------------------------------------------------------
-
-/// struct pci_io from <sys/pciio.h>.
-#[repr(C)]
-struct PciIo {
-    sel: PciSel,
-    reg: libc::c_int,
-    width: libc::c_int,
-    data: u32,
-}
-
-const PCIOCREAD: libc::c_ulong = iowr(b'p', 2, std::mem::size_of::<PciIo>());
-const PCIOCWRITE: libc::c_ulong = iowr(b'p', 3, std::mem::size_of::<PciIo>());
-/// SMN index/data pair in the host bridge's config space (Zen and later),
-/// the one FreeBSD's amdsmn(4) uses.
-const SMN_INDEX: libc::c_int = 0x60;
-const SMN_DATA: libc::c_int = 0x64;
-
-/// AMD's System Management Network, reached through the host bridge (PCI
-/// 0:0:0) from userland: write the address to the index register, read the
-/// data register. Root only (/dev/pci opened for writing).
-struct Smn {
-    pci: std::fs::File,
-}
-
-impl Smn {
-    fn open() -> Result<Self, String> {
-        let pci = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/pci")
-            .map_err(|e| format!("/dev/pci: {e}"))?;
-        let smn = Smn { pci };
-        match smn.config(PCIOCREAD, 0, 0) {
-            Some(id) if id & 0xFFFF == 0x1022 => Ok(smn),
-            _ => Err("host bridge 0:0:0 isn't AMD's".into()),
-        }
-    }
-
-    fn config(&self, op: libc::c_ulong, reg: libc::c_int, data: u32) -> Option<u32> {
-        use std::os::fd::AsRawFd;
-        let mut io = PciIo { sel: PciSel::default(), reg, width: 4, data };
-        // SAFETY: PCIOCREAD/PCIOCWRITE on a struct pci_io we own.
-        (unsafe { libc::ioctl(self.pci.as_raw_fd(), op, &mut io) } == 0).then_some(io.data)
-    }
-
-    /// One SMN register. The kernel's amdtemp uses the same index/data pair
-    /// under a lock userland can't take, so a value only counts if two reads
-    /// agree.
-    fn read(&self, addr: u32) -> Option<u32> {
-        let once = || {
-            self.config(PCIOCWRITE, SMN_INDEX, addr)?;
-            self.config(PCIOCREAD, SMN_DATA, 0)
-        };
-        (0..3).find_map(|_| {
-            let a = once()?;
-            (once()? == a).then_some(a)
-        })
-    }
-}
-
-/// The timings the memory controller runs, read over SMN through /dev/pci.
-pub fn umc_timings() -> Result<(u32, [u32; 4]), String> {
-    crate::devnames::check_amd_zen4()?;
-    let smn = Smn::open()?;
-    crate::devnames::umc_timings_via(|addr| smn.read(addr))
-}
-
-/// `oryn --ram-info`: each step behind the RAM names, temperatures, speed and
-/// timings, and where it stops.
+/// `oryn --ram-info`: each step behind the RAM names, temperatures and speed,
+/// and where it stops.
 pub fn ram_report() -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -869,12 +792,12 @@ pub fn ram_report() -> String {
                             if spd[2] == 0x12 { " (DDR5)" } else { "" },
                             crate::devnames::parse_spd(&spd).unwrap_or_else(|| "no name".into()));
                         let _ = writeln!(out, "        {}", crate::devnames::spd_block_status(&spd));
-                        let sets = crate::devnames::spd_timings(&spd);
+                        let sets = crate::devnames::spd_profiles(&spd);
                         if sets.is_empty() {
-                            let _ = writeln!(out, "        no timings decoded");
+                            let _ = writeln!(out, "        no speed profiles decoded");
                         }
                         for t in &sets {
-                            let _ = writeln!(out, "        {} {} MT/s: CL{}-{}-{}-{}", t.profile, t.mts, t.cl, t.rcd, t.rp, t.ras);
+                            let _ = writeln!(out, "        {} {} MT/s", t.profile, t.mts);
                         }
                         crate::devnames::note_spd(&spd);
                         Ok(())
@@ -899,18 +822,9 @@ pub fn ram_report() -> String {
         }
     };
     let _ = writeln!(out, "  sticks: {:?}", dmi.sticks);
-    let _ = writeln!(out, "  speed: {} (MT/s for timings: {:?})", dmi.speed.as_deref().unwrap_or("unknown"), dmi.mts);
-    match umc_timings() {
-        Ok((ch, t)) => {
-            let _ = writeln!(out, "Memory controller (UMC channel {ch}): CL{}-{}-{}-{} in use", t[0], t[1], t[2], t[3]);
-            crate::devnames::note_current_timings(t);
-        }
-        Err(e) => {
-            let _ = writeln!(out, "Memory controller: {e}{}", if crate::nvapi::is_root() { "" } else { " (run with sudo)" });
-        }
-    }
-    let _ = writeln!(out, "Timings shown in specs: {}", crate::devnames::ram_timings_text(dmi.mts)
-        .unwrap_or_else(|| "none (no SPD timings read)".into()));
+    let _ = writeln!(out, "  speed: {}", dmi.speed.as_deref().unwrap_or("unknown"));
+    let _ = writeln!(out, "Speed shown in specs: {}", crate::devnames::ram_speed_line(dmi.speed, dmi.mts)
+        .unwrap_or_else(|| "none".into()));
     out
 }
 
@@ -1398,24 +1312,6 @@ mod tests {
         assert_eq!(spd5118_temp(0x64, 0x02), 38.25); // 153 quarter degrees
         assert_eq!(spd5118_temp(0xF0, 0x1F), -1.0); // sign bit 12
         assert_eq!(spd5118_temp(0x30, 0x05), 83.0); // a typical critical limit
-    }
-
-    #[test]
-    fn umc_timing_registers() {
-        // Checked against <sys/pciio.h> on FreeBSD 15 (amd64).
-        assert_eq!(std::mem::size_of::<PciIo>(), 20);
-        assert_eq!((PCIOCREAD, PCIOCWRITE), (0xC014_7002, 0xC014_7003));
-        // 0x50204: RCDWR 29:24, RCDRD 21:16, RAS 14:8, CL 5:0.
-        // 0x50208: RPpb 29:24, RP 21:16, RCpb 15:8, RC 7:0.
-        let r204 = (36 << 24) | (38 << 16) | (76 << 8) | 32;
-        let r208 = (38 << 24) | (38 << 16) | (114 << 8) | 114;
-        assert_eq!(crate::devnames::decode_umc(r204, r208), Some([32, 38, 38, 76]));
-        assert_eq!(crate::devnames::decode_umc(u32::MAX, u32::MAX), None); // unreadable
-        assert_eq!(crate::devnames::decode_umc(0, 0), None);
-        // This machine's CPU, when it's AMD.
-        if cpu_model().is_some_and(|m| m.contains("AMD")) {
-            assert!(crate::devnames::amd_family().is_some_and(|f| f >= 0x17));
-        }
     }
 
     #[test]

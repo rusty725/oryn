@@ -86,16 +86,16 @@ you can show, hide and rearrange.
 
 The [releases](https://github.com/rusty725/oryn/releases) have
 ready-made packages for x86_64 (64-bit Intel/AMD): the Linux ones below are
-from [v0.1.10](https://github.com/rusty725/oryn/releases/tag/v0.1.10), the
+from [v0.1.11](https://github.com/rusty725/oryn/releases/tag/v0.1.11), the
 FreeBSD ones from [v0.1.8](https://github.com/rusty725/oryn/releases/tag/v0.1.8).
 On other machines (aarch64…), [build from source](#any-linux-distribution-from-source).
 
 | Package | For |
 |---------|-----|
-| `oryn-0.1.10-1-x86_64.pkg.tar.zst` | Arch Linux, CachyOS, EndeavourOS, Manjaro |
-| `oryn_0.1.10-1_amd64.deb` | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS |
-| `oryn-0.1.10-1.x86_64.rpm` | Fedora, RHEL / Rocky / Alma 9+, openSUSE |
-| `oryn-0.1.10-x86_64-linux.tar.gz` | any other x86_64 Linux with glibc 2.34+ |
+| `oryn-0.1.11-1-x86_64.pkg.tar.zst` | Arch Linux, CachyOS, EndeavourOS, Manjaro |
+| `oryn_0.1.11-1_amd64.deb` | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS |
+| `oryn-0.1.11-1.x86_64.rpm` | Fedora, RHEL / Rocky / Alma 9+, openSUSE |
+| `oryn-0.1.11-x86_64-linux.tar.gz` | any other x86_64 Linux with glibc 2.34+ |
 | `oryn-0.1.8-freebsd-amd64.pkg` | FreeBSD 15 (amd64), installed with `pkg` |
 | `oryn-0.1.8-amd64-freebsd.tar.gz` | FreeBSD 15 (amd64): binary, man page and instructions |
 
@@ -107,8 +107,8 @@ run `sha256sum -c --ignore-missing SHA256SUMS`.
 ### Arch Linux, CachyOS, Manjaro
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.10/oryn-0.1.10-1-x86_64.pkg.tar.zst
-sudo pacman -U oryn-0.1.10-1-x86_64.pkg.tar.zst
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.11/oryn-0.1.11-1-x86_64.pkg.tar.zst
+sudo pacman -U oryn-0.1.11-1-x86_64.pkg.tar.zst
 sudo pacman -S --needed --asdeps smartmontools hwdata   # optional extras
 ```
 
@@ -124,8 +124,8 @@ makepkg -si
 ### Debian, Ubuntu, Linux Mint, Pop!_OS
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.10/oryn_0.1.10-1_amd64.deb
-sudo apt install ./oryn_0.1.10-1_amd64.deb
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.11/oryn_0.1.11-1_amd64.deb
+sudo apt install ./oryn_0.1.11-1_amd64.deb
 sudo apt install smartmontools          # optional extra
 ```
 
@@ -135,8 +135,8 @@ in its repositories instead of the file.
 ### Fedora, RHEL, Rocky, AlmaLinux
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.10/oryn-0.1.10-1.x86_64.rpm
-sudo dnf install ./oryn-0.1.10-1.x86_64.rpm
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.11/oryn-0.1.11-1.x86_64.rpm
+sudo dnf install ./oryn-0.1.11-1.x86_64.rpm
 ```
 
 `dnf` also installs the recommended `smartmontools` and `hwdata`.
@@ -144,8 +144,8 @@ sudo dnf install ./oryn-0.1.10-1.x86_64.rpm
 ### openSUSE
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.10/oryn-0.1.10-1.x86_64.rpm
-sudo zypper install --allow-unsigned-rpm ./oryn-0.1.10-1.x86_64.rpm
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.11/oryn-0.1.11-1.x86_64.rpm
+sudo zypper install --allow-unsigned-rpm ./oryn-0.1.11-1.x86_64.rpm
 ```
 
 ### Any other Linux: the .tar.gz
@@ -154,9 +154,9 @@ A plain binary plus the man page, for distributions without a package
 above. Needs glibc 2.34 or newer (`ldd --version` shows yours).
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.10/oryn-0.1.10-x86_64-linux.tar.gz
-tar xzf oryn-0.1.10-x86_64-linux.tar.gz
-cd oryn-0.1.10-x86_64-linux
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.11/oryn-0.1.11-x86_64-linux.tar.gz
+tar xzf oryn-0.1.11-x86_64-linux.tar.gz
+cd oryn-0.1.11-x86_64-linux
 sudo install -Dm755 oryn /usr/local/bin/oryn
 sudo install -Dm644 oryn.1 /usr/local/share/man/man1/oryn.1
 ```
@@ -209,7 +209,7 @@ so the package installs nothing else. These are optional and add readings:
 |----------|--------------|-----|
 | `amdtemp` / `coretemp` kernel module | CPU temperatures (AMD / Intel) | `kldload amdtemp` |
 | `cpuctl` kernel module | CPU power draw in watts (root) | `kldload cpuctl` |
-| `smb` kernel module | DDR5 RAM temperatures, part numbers and timings (root; on AMD Zen 4/5 the timings in use, read from the memory controller) | `kldload smb` |
+| `smb` kernel module | DDR5 RAM temperatures, part numbers and rated speeds (root) | `kldload smb` |
 | `smartmontools` package | SATA drive temperatures, SMART data | `pkg install smartmontools` |
 | `dmidecode` package | RAM model and speed without root (with a sudoers rule) | `pkg install dmidecode` |
 | `nvidia-driver` package | NVIDIA GPU panel (`nvidia-smi`) | `pkg install nvidia-driver` |
@@ -438,7 +438,7 @@ Like btop, every panel can be shown or hidden:
 | 6   | net     | download/upload graph, speeds, totals (`n` = next interface) |
 | 7   | proc    | processes: scroll, filter, start, terminate, kill, nice (see [Process list](#process-list)) |
 | 8   | gpu     | GPU usage, VRAM, temperatures, power, fan, clocks, VRAM chips |
-| 9   | specs   | OS, kernel, host, uptime, board/BIOS, CPU, GPU (with VBIOS version), monitors with current and maximum refresh rate ("DP-3 · LG ULTRAGEAR+ · 3840×2160 · 144 Hz (max 240 Hz) · 31.5″"), RAM sticks, RAM speed and timings, in use and as the XMP/EXPO profile rates them ("DDR5 · 6000 MT/s · XMP 6400 MT/s", "CL30-38-38-76 in use · XMP CL32-39-39-102 @ 6400"), drives (with firmware version), network adapters with model and driver ("Realtek RTL8126 5GbE Controller · r8169 driver"), desktop with its version ("KDE Plasma 6.2.4 · Wayland"), shell, terminal |
+| 9   | specs   | OS, kernel, host, uptime, board/BIOS, CPU, GPU (with VBIOS version), monitors with current and maximum refresh rate ("DP-3 · LG ULTRAGEAR+ · 3840×2160 · 144 Hz (max 240 Hz) · 31.5″"), RAM sticks, RAM speed, as set and as the XMP/EXPO profile rates it ("DDR5 · 6000 MT/s · XMP 6400 MT/s"), drives (with firmware version), network adapters with model and driver ("Realtek RTL8126 5GbE Controller · r8169 driver"), desktop with its version ("KDE Plasma 6.2.4 · Wayland"), shell, terminal |
 
 ### Arranging panels
 
@@ -554,16 +554,8 @@ the BIOS reports (SMBIOS type 17), which also needs root. GPU names need
 
 The specs panel's **Speed** line shows the speed the BIOS set and the
 sticks' top XMP/EXPO rating ("DDR5 · 6000 MT/s · XMP 6400 MT/s"; the
-speed needs root). The **Timings** line shows the timings the memory
-controller runs, then the rated ones ("CL30-38-38-76 in use · XMP
-CL32-39-39-102 @ 6400"). The ones in use are read on AMD Zen 4/5 with DDR5, when Oryn runs
-as root on a kernel booted with the `amd_smn_debugfs_enable` option (Linux
-6.14+; add it to the kernel command line, e.g. in `/etc/default/grub` or
-your boot loader entry). The kernel keeps the memory controller's registers
-to itself otherwise, and Oryn doesn't go around it. Without that, the
-timings come from the sticks' SPD: the profile for the speed the memory
-runs at ("CL32-39-39-102 (XMP)"), or, when the speed was set by hand, only
-the stick's top rating ("XMP CL32-39-39-102 @ 6400 (rated)").
+speed needs root). `oryn --ram-info` shows each step behind the RAM names
+and speed, and where it stops.
 
 ## GPU temperatures
 

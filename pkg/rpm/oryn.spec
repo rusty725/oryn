@@ -8,7 +8,7 @@
 %global _docdir_fmt %{name}
 
 Name:           oryn
-Version:        0.1.10
+Version:        0.1.11
 Release:        1%{?dist}
 Summary:        Terminal hardware monitor with every temperature sensor
 
@@ -57,6 +57,11 @@ install -Dm0644 doc/oryn.1 %{buildroot}%{_mandir}/man1/oryn.1
 %{_mandir}/man1/oryn.1*
 
 %changelog
+* Sun Oct 18 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.11-1
+- Specs panel: the RAM Timings line is removed; the Speed line still shows
+  the speed in use and the sticks' XMP/EXPO rating.
+- oryn --ram-info now also works on Linux.
+
 * Sun Oct 18 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.10-1
 - Specs panel: RAM Speed and Timings lines, with the timings the memory
   controller runs (AMD Zen 4/5 with DDR5) next to the sticks' rated

@@ -910,21 +910,11 @@ impl App {
         if dimms.iter().all(|d| d.starts_with("RAM DIMM")) && !dmi.sticks.is_empty() {
             dimms = dmi.sticks.clone();
         }
-        // The timings in use, from AMD's memory controller (DDR5 on Zen 4/5;
-        // root and the kernel's SMN debugfs). Read once, here.
-        #[cfg(target_os = "linux")]
-        if dmi.speed.as_deref().is_some_and(|s| s.starts_with("DDR5"))
-            && let Ok((_, t)) = devnames::umc_timings_linux(std::path::Path::new(
-                &crate::env_os("SYSFS").unwrap_or_else(|| "/".into()),
-            ))
-        {
-            devnames::note_current_timings(t);
-        }
-        // Then the timings for that speed, from the sticks' SPD chips.
+        // Then the sticks' rated speeds, from their SPD chips.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        let (ram_speed, ram_timings) = (devnames::ram_speed_line(dmi.speed, dmi.mts), devnames::ram_timings_text(dmi.mts));
+        let ram_speed = devnames::ram_speed_line(dmi.speed, dmi.mts);
         #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-        let (ram_speed, ram_timings): (Option<String>, Option<String>) = (None, None);
+        let ram_speed: Option<String> = None;
         let sys = sysinfo::System::new_with_specifics(
             sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()),
         );
@@ -935,7 +925,6 @@ impl App {
             &gpus,
             &dimms,
             ram_speed.as_deref(),
-            ram_timings.as_deref(),
         );
         self.specs = Some((s, gpus.len()));
     }
@@ -1002,7 +991,7 @@ fn main() -> io::Result<()> {
              --theme <name>  color scheme, e.g. dracula, nord, tokyo-night\n\
              --themes        list the available color schemes\n\
              --gpu-info      explain which GPU temperatures (VRAM, hotspot) can be read\n\
-             --ram-info      explain what was read for RAM names, speed and timings (FreeBSD)\n\
+             --ram-info      explain what was read for RAM names and speed\n\
              --mem-probe     check which part of Oryn, if any, keeps memory (no UI, ~1 min)\n\
              --version       print the version\n\
              --compact       start in compact mode (temperatures only; `c` toggles)\n\
@@ -1028,8 +1017,10 @@ fn main() -> io::Result<()> {
     if args.iter().any(|a| a == "--ram-info") {
         #[cfg(target_os = "freebsd")]
         print!("{}", freebsd::ram_report());
-        #[cfg(not(target_os = "freebsd"))]
-        println!("--ram-info is FreeBSD-only.");
+        #[cfg(target_os = "linux")]
+        print!("{}", devnames::ram_report(std::path::Path::new(&crate::env_os("SYSFS").unwrap_or_else(|| "/".into()))));
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        println!("--ram-info is Linux and FreeBSD only.");
         return Ok(());
     }
     if args.iter().any(|a| a == "-V" || a == "--version") {
