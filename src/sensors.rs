@@ -6,6 +6,7 @@
 //! zones such as `x86_pkg_temp` are ignored whenever any hwmon device exists.
 //! Here every sensor is keyed by its sysfs location, so nothing is merged.
 
+#[derive(Clone)]
 pub struct Reading {
     /// Stable unique key (sysfs path based); never shown to the user.
     pub id: String,

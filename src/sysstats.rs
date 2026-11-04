@@ -5,7 +5,7 @@
 //! Only the panels that are visible are refreshed, so hiding the process
 //! list (the most expensive one) also saves CPU.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use sysinfo::{
@@ -13,7 +13,9 @@ use sysinfo::{
     ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind, Users,
 };
 
-pub const HIST: usize = 120;
+/// Samples kept per usage/network history: one per column of the widest
+/// graphs (a few KiB each).
+pub const HIST: usize = 600;
 
 static DEMO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -71,6 +73,9 @@ pub struct ProcInfo {
     pub cpu: f32,
     /// Scheduling priority (-20 … 19), when known.
     pub nice: Option<i32>,
+    /// Start time (seconds since the epoch; 0 when unknown): with the PID
+    /// and name it tells this process from a later one given the same PID.
+    pub start: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -121,6 +126,9 @@ pub struct SysStats {
     /// the process list (or nothing, in compact mode) mustn't shorten it.
     last_disks: Instant,
     last_net: Instant,
+    /// Disks and interfaces read in the previous refresh (see [`steady`]).
+    known_disks: HashSet<String>,
+    known_nets: HashSet<String>,
 
     pub cpu_name: String,
     pub cpu_total: f32,
@@ -163,10 +171,16 @@ impl SysStats {
             let _guard = libc_buffers();
             Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage().with_io_usage())
         };
+        let nets_src = Networks::new_with_refreshed_list();
+        // Read once already, so their next deltas are real.
+        let known_disks = disks_src.list().iter().map(|d| d.name().to_string_lossy().to_string()).collect();
+        let known_nets = nets_src.list().keys().cloned().collect();
         let mut s = Self {
             sys,
             disks_src,
-            nets_src: Networks::new_with_refreshed_list(),
+            nets_src,
+            known_disks,
+            known_nets,
             users: Users::new_with_refreshed_list(),
             user_names: HashMap::new(),
             last_disks: Instant::now(),
@@ -269,6 +283,7 @@ impl SysStats {
                 DiskRefreshKind::nothing().with_storage().with_io_usage(),
             );
             let mut seen = std::collections::HashSet::new();
+            let known = std::mem::take(&mut self.known_disks);
             let mut list: Vec<DiskInfo> = self
                 .disks_src
                 .list()
@@ -291,13 +306,14 @@ impl SysStats {
                         mount.rsplit(['/', '\\']).find(|s| !s.is_empty()).unwrap_or(&mount).to_string()
                     };
                     let u = d.usage();
+                    let name = d.name().to_string_lossy();
                     DiskInfo {
                         label,
                         mount,
                         total: d.total_space(),
                         used: d.total_space().saturating_sub(d.available_space()),
-                        read_rate: u.read_bytes as f64 / dt,
-                        write_rate: u.written_bytes as f64 / dt,
+                        read_rate: steady(&known, &mut self.known_disks, &name, u.read_bytes) as f64 / dt,
+                        write_rate: steady(&known, &mut self.known_disks, &name, u.written_bytes) as f64 / dt,
                     }
                 })
                 .collect();
@@ -310,14 +326,15 @@ impl SysStats {
             self.nets_src.refresh(true);
             let sel_name = self.nets.get(self.net_sel).map(|n| n.name.clone());
             let mut updated: Vec<NetInfo> = Vec::new();
+            let known = std::mem::take(&mut self.known_nets);
             for (name, d) in self.nets_src.list() {
                 if name == "lo" || name.starts_with("lo") && d.mac_address().0 == [0; 6] {
                     continue;
                 }
                 let mut n = self.nets.iter().find(|n| &n.name == name).cloned().unwrap_or_default();
                 n.name = name.clone();
-                n.rx_rate = d.received() as f64 / dt;
-                n.tx_rate = d.transmitted() as f64 / dt;
+                n.rx_rate = steady(&known, &mut self.known_nets, name, d.received()) as f64 / dt;
+                n.tx_rate = steady(&known, &mut self.known_nets, name, d.transmitted()) as f64 / dt;
                 n.rx_total = d.total_received();
                 n.tx_total = d.total_transmitted();
                 n.ip = d
@@ -390,6 +407,7 @@ impl SysStats {
             mem: 0,
             cpu: 0.0,
             nice: crate::procctl::nice_of(pid),
+            start: crate::procctl::lookup(pid).map_or(0, |(_, start)| start),
         });
         self.proc_count += 1;
         sort_procs(&mut self.procs, self.proc_sort);
@@ -447,6 +465,7 @@ impl SysStats {
                     mem: p.memory(),
                     cpu: p.cpu_usage(),
                     nice: crate::procctl::nice_of(pid.as_u32()),
+                    start: p.start_time(),
                 }
             })
             .collect();
@@ -559,6 +578,16 @@ fn sort_procs(list: &mut [ProcInfo], by: ProcSort) {
     }
 }
 
+/// sysinfo starts the byte counters of a disk or interface it hasn't read
+/// before (plugged in, or brought up after Oryn started) at zero, so its
+/// first delta is everything since boot: one huge spike in the graphs.
+/// That first sample counts as 0. `now` collects the names read this time,
+/// for the next refresh; one that disappears and comes back starts over.
+fn steady(known: &HashSet<String>, now: &mut HashSet<String>, name: &str, bytes: u64) -> u64 {
+    now.insert(name.to_string());
+    if known.contains(name) { bytes } else { 0 }
+}
+
 fn push<T>(h: &mut VecDeque<T>, v: T) {
     if h.len() == HIST {
         h.pop_front();
@@ -626,6 +655,22 @@ mod tests {
         assert_eq!(human(9_513_000_000.0), "8.86 GiB");
         assert_eq!(human(229_376.0), "224 KiB");
         assert_eq!(human_bits(6656.0), "52.0 Kibps");
+    }
+
+    #[test]
+    fn new_disk_or_interface_starts_at_zero() {
+        // One refresh after another: em0 known from the start, ue0 plugged
+        // in at the second (its counter holds everything since boot).
+        let mut known: HashSet<String> = ["em0".to_string()].into();
+        let mut now = HashSet::new();
+        assert_eq!(steady(&known, &mut now, "em0", 1500), 1500);
+        assert_eq!(steady(&known, &mut now, "ue0", 9_000_000_000), 0);
+        known = std::mem::take(&mut now);
+        assert_eq!(steady(&known, &mut now, "ue0", 4000), 4000);
+        // Unplugged (missing from one refresh), then back: zero again.
+        known = std::mem::take(&mut now);
+        assert!(!known.contains("em0"));
+        assert_eq!(steady(&known, &mut now, "em0", 9_000_000_000), 0);
     }
 
     #[cfg(target_os = "linux")]

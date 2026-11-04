@@ -834,33 +834,17 @@ fn command_version(cmd: &str, arg: &str) -> Option<String> {
 }
 
 /// Run a command and return what it printed (stdout, then stderr). Gives
-/// up after a second.
+/// up after a second; the output is read while it runs, so a long one
+/// (`xrandr --prop` with many outputs) can't stall it.
 fn run_quick(cmd: &str, args: &[&str]) -> Option<String> {
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-    let mut child = Command::new(cmd)
-        .args(args)
-        // Qt programs (plasmashell, lxqt-session) want a display before they
-        // even print their version; this lets them run without one (sudo, SSH).
-        .env("QT_QPA_PLATFORM", "offscreen")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if start.elapsed() < Duration::from_secs(1) => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
-    let out = child.wait_with_output().ok()?;
+    let out = crate::cmd::output_within(
+        std::process::Command::new(cmd)
+            .args(args)
+            // Qt programs (plasmashell, lxqt-session) want a display before they
+            // even print their version; this lets them run without one (sudo, SSH).
+            .env("QT_QPA_PLATFORM", "offscreen"),
+        std::time::Duration::from_secs(1),
+    )?;
     // Some print their version on stderr (river, bspwm on some builds).
     Some(format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
 }
@@ -918,6 +902,16 @@ mod tests {
         assert_eq!(parse_version("niri 25.05.1 (commit 1234abc)").as_deref(), Some("25.05.1"));
         assert_eq!(parse_version("i3 version 4.23 (2023-10-29) © 2009 Michael Stapelberg").as_deref(), Some("4.23"));
         assert_eq!(parse_version("no version here"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_quick_reads_long_output() {
+        // Like `xrandr --current --prop` with many outputs: far more than a
+        // pipe holds, which used to block the child until it was killed.
+        let out = run_quick("/bin/sh", &["-c", "yes 'HDMI-1 connected 2560x1440+0+0' | head -c 200000"]).unwrap();
+        assert!(out.len() > 200_000);
+        assert!(run_quick("/bin/sh", &["-c", "sleep 5"]).is_none());
     }
 
     #[test]

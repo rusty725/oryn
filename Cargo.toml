@@ -1,7 +1,8 @@
 [package]
 name = "oryn"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 description = "Terminal hardware monitor: every temperature sensor plus btop-style CPU, GPU, memory, disk, network and process panels"
 

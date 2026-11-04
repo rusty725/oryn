@@ -29,11 +29,24 @@ adds readings.
                        # NVIDIA hotspot / VRAM temperatures
 
    Optional: let a normal `oryn` use smartctl and dmidecode without a
-   password (Oryn only ever runs them with `sudo -n`, never asks):
+   password (Oryn only ever runs them with `sudo -n`, never asks). The
+   rule allows only the read-only commands Oryn runs, not the programs
+   with any arguments (as root they can change drive settings or
+   overwrite files):
 
-     echo "$USER ALL=(root) NOPASSWD: /usr/local/sbin/smartctl, /usr/local/sbin/dmidecode" \
-       | sudo tee /usr/local/etc/sudoers.d/oryn
+     SMART="/usr/local/sbin/smartctl -j -n standby -i -A"
+     printf '%s\n' \
+       "$USER ALL=(root) NOPASSWD: $SMART -d nvme /dev/nvme[0-9], $SMART -d nvme /dev/nvme[1-9][0-9]" \
+       "$USER ALL=(root) NOPASSWD: $SMART -d atacam /dev/ada[0-9], $SMART -d atacam /dev/ada[1-9][0-9]" \
+       "$USER ALL=(root) NOPASSWD: $SMART /dev/da[0-9], $SMART /dev/da[1-9][0-9]" \
+       "$USER ALL=(root) NOPASSWD: $SMART -d sat /dev/da[0-9], $SMART -d sat /dev/da[1-9][0-9]" \
+       "$USER ALL=(root) NOPASSWD: /usr/local/sbin/dmidecode -t 17" \
+       | sudo tee /usr/local/etc/sudoers.d/oryn >/dev/null
      sudo chmod 440 /usr/local/etc/sudoers.d/oryn
+     sudo visudo -cf /usr/local/etc/sudoers.d/oryn
+
+   Device names use [0-9], not *: in sudoers a * in the arguments also
+   matches spaces, so it would allow extra arguments.
 
 Check what was found:  oryn --list
 Manual:                man oryn

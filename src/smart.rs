@@ -7,25 +7,37 @@
 //!   changes slowly anyway.
 //! * Every query passes `-n standby`, so a sleeping hard drive is reported
 //!   as "standby" and is never spun up just to read its temperature.
-//! * Reading SMART needs root/admin; without it rows say "needs root".
+//! * Reading SMART needs root/admin; without it rows say "needs root", unless
+//!   a sudoers rule lets `sudo -n smartctl` run (see README). Each run through
+//!   sudo is a line in the auth log, so those disks are read every
+//!   [`SUDO_POLL`] only.
+//! * Every smartctl run is killed after [`RUN_TIMEOUT`], and a disk that gives
+//!   no temperature with any device type (mfid, vtbd, some USB bridges) is
+//!   only tried again every [`RETRY_FAILED`].
 //!
 //! On Linux, disks already covered by the `drivetemp` or `nvme` hwmon drivers
 //! are skipped so they don't appear twice. If `smartctl` isn't installed,
 //! uncovered SATA disks still get a row with a hint on how to enable them.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(unix)]
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde_json::Value;
 
 use crate::sensors::{Reading, Source};
 
 pub const POLL: Duration = Duration::from_secs(30);
+/// How long one smartctl run may take before it is killed.
+const RUN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Disks read through `sudo -n smartctl` are read this often at most.
+const SUDO_POLL: Duration = Duration::from_secs(300);
+/// Disks no device type gives a temperature for are retried this often.
+const RETRY_FAILED: Duration = Duration::from_secs(600);
 
 #[derive(Clone)]
 struct Disk {
@@ -73,12 +85,14 @@ fn smartctl_exe() -> String {
 }
 
 fn smartctl_available() -> bool {
-    Command::new(smartctl_exe()).arg("--version").output().is_ok_and(|o| o.status.success())
+    crate::cmd::output_within(Command::new(smartctl_exe()).arg("--version"), RUN_TIMEOUT).is_some_and(|o| o.status.success())
 }
 
 /// `smartctl --scan -j` -> [(path, type)]
 fn scan() -> Vec<(String, Option<String>)> {
-    let Ok(out) = Command::new(smartctl_exe()).args(["--scan", "-j"]).output() else { return vec![] };
+    let Some(out) = crate::cmd::output_within(Command::new(smartctl_exe()).args(["--scan", "-j"]), RUN_TIMEOUT) else {
+        return vec![];
+    };
     let Ok(v) = serde_json::from_slice::<Value>(&out.stdout) else { return vec![] };
     v["devices"]
         .as_array()
@@ -180,17 +194,36 @@ impl SmartPoller {
         let disks = Arc::new(Mutex::new(disks));
         if have_smartctl {
             let shared = Arc::clone(&disks);
-            thread::spawn(move || loop {
-                let snapshot: Vec<Disk> = shared.lock().unwrap().clone();
-                for d in snapshot {
-                    let updated = query(d);
-                    if let Some(slot) =
-                        shared.lock().unwrap().iter_mut().find(|x| x.path == updated.path)
-                    {
-                        *slot = updated;
+            thread::spawn(move || {
+                // When each disk is next due (see next_wait).
+                let mut due: HashMap<String, Instant> = HashMap::new();
+                loop {
+                    let snapshot: Vec<Disk> = shared.lock().unwrap().clone();
+                    let mut round = SudoUse::default();
+                    for d in snapshot {
+                        if due.get(&d.path).is_some_and(|t| Instant::now() < *t) {
+                            continue;
+                        }
+                        let mut sudo = SudoUse::default();
+                        let updated = query(d, &mut sudo);
+                        due.insert(updated.path.clone(), Instant::now() + next_wait(&updated, sudo));
+                        round.tried |= sudo.tried;
+                        round.ran |= sudo.ran;
+                        round.denied |= sudo.denied;
+                        if let Some(slot) =
+                            shared.lock().unwrap().iter_mut().find(|x| x.path == updated.path)
+                        {
+                            *slot = updated;
+                        }
                     }
+                    // sudo refused every attempt of a whole round and never
+                    // worked before: no rule for us, so stop asking.
+                    #[cfg(unix)]
+                    if round.denied && !round.ran {
+                        let _ = SUDO.compare_exchange(SUDO_UNTRIED, SUDO_OFF, Ordering::Relaxed, Ordering::Relaxed);
+                    }
+                    thread::sleep(POLL);
                 }
-                thread::sleep(POLL);
             });
         }
         Some(Self { disks })
@@ -239,9 +272,37 @@ impl SmartPoller {
     }
 }
 
+/// What `sudo -n smartctl` did during one query.
+#[derive(Clone, Copy, Default)]
+struct SudoUse {
+    /// sudo was started.
+    tried: bool,
+    /// It ran smartctl.
+    ran: bool,
+    /// It refused (no rule for these arguments, or none at all).
+    denied: bool,
+}
+
+/// How long until a disk is queried again: SMART through sudo every
+/// [`SUDO_POLL`] (each run is logged), a disk nothing gets a temperature
+/// from every [`RETRY_FAILED`], everything else every [`POLL`].
+fn next_wait(d: &Disk, sudo: SudoUse) -> Duration {
+    let failed = d.temp.is_none() && !matches!(d.note.as_deref(), Some("standby") | Some("needs root"));
+    let mut wait = POLL;
+    if sudo.tried {
+        wait = wait.max(SUDO_POLL);
+    }
+    // sudo refusing this disk (while it may work for others) means the
+    // sudoers rule doesn't cover its device type.
+    if failed || sudo.denied {
+        wait = wait.max(RETRY_FAILED);
+    }
+    wait
+}
+
 /// One SMART query for one disk. Keeps the last good temperature when the
 /// disk has gone to sleep, so the row shows "standby" with its last value.
-fn query(d: Disk) -> Disk {
+fn query(d: Disk, sudo: &mut SudoUse) -> Disk {
     // The type from --scan first, then smartctl's auto-detection, then plain
     // SAT (most USB enclosures). The first one that yields a temperature is
     // remembered for later polls.
@@ -255,9 +316,12 @@ fn query(d: Disk) -> Disk {
     for kind in kinds {
         let mut probe = d.clone();
         probe.kind = kind;
-        query_once(&mut probe);
+        let denied = query_once(&mut probe, sudo);
+        // "needs root" ends it unless sudo refused just these arguments:
+        // the sudoers rule may allow another device type.
         let done = probe.note.is_none()
-            || matches!(probe.note.as_deref(), Some("standby") | Some("needs root"));
+            || probe.note.as_deref() == Some("standby")
+            || (probe.note.as_deref() == Some("needs root") && !denied);
         if done {
             return probe;
         }
@@ -267,7 +331,9 @@ fn query(d: Disk) -> Disk {
     first_note.unwrap_or(d)
 }
 
-fn query_once(d: &mut Disk) {
+/// One smartctl run (and, without root, one through `sudo -n`). Returns
+/// whether sudo refused it.
+fn query_once(d: &mut Disk, sudo: &mut SudoUse) -> bool {
     let mut args: Vec<String> =
         ["-j", "-n", "standby", "-i", "-A"].iter().map(|s| s.to_string()).collect();
     if let Some(k) = &d.kind {
@@ -275,38 +341,64 @@ fn query_once(d: &mut Disk) {
     }
     args.push(d.path.clone());
 
-    let Ok(out) = Command::new(smartctl_exe()).args(&args).output() else {
+    let Some(out) = crate::cmd::output_within(Command::new(smartctl_exe()).args(&args), RUN_TIMEOUT) else {
         d.note = Some("smartctl failed to run".into());
-        return;
+        return false;
     };
     let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
     apply(d, &v);
 
     // Not running as root: try `sudo -n smartctl …`. `-n` never prompts; it
-    // only succeeds if a sudoers rule allows smartctl without a password
-    // (see README). Once that fails, stop trying for the rest of the run.
+    // only succeeds if a sudoers rule allows smartctl with exactly these
+    // arguments without a password (see README). The argument list above
+    // is what that rule has to match.
     #[cfg(unix)]
-    if d.note.as_deref() == Some("needs root") && SUDO_OK.load(Ordering::Relaxed) {
-        let v = Command::new("sudo")
-            .arg("-n")
-            .arg(smartctl_exe())
-            .args(&args)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()
-            .filter(|o| !o.stdout.is_empty())
-            .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok());
-        match v {
-            Some(v) => apply(d, &v),
-            None => SUDO_OK.store(false, Ordering::Relaxed),
+    if d.note.as_deref() == Some("needs root") && SUDO.load(Ordering::Relaxed) != SUDO_OFF {
+        sudo.tried = true;
+        // LC_ALL=C keeps sudo's refusal in English for sudo_refused.
+        let mut cmd = Command::new("sudo");
+        cmd.env("LC_ALL", "C").arg("-n").arg(smartctl_exe()).args(&args);
+        let run = crate::cmd::output_within(&mut cmd, RUN_TIMEOUT);
+        // No sudo installed, or a timeout: tried again at the next sudo poll.
+        let Some(o) = run else { return false };
+        match serde_json::from_slice::<Value>(&o.stdout) {
+            Ok(v) if !o.stdout.is_empty() => {
+                sudo.ran = true;
+                SUDO.store(SUDO_WORKS, Ordering::Relaxed);
+                apply(d, &v);
+            }
+            _ if sudo_refused(&String::from_utf8_lossy(&o.stderr)) => {
+                sudo.denied = true;
+                return true;
+            }
+            _ => {}
         }
     }
+    #[cfg(not(unix))]
+    let _ = sudo;
+    false
 }
 
-/// Whether `sudo -n smartctl` is still worth trying.
+/// Whether `sudo -n smartctl` is worth trying: untried, known to work, or
+/// off for the rest of the run (refused for every disk in a whole round).
 #[cfg(unix)]
-static SUDO_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static SUDO: AtomicU8 = AtomicU8::new(SUDO_UNTRIED);
+#[cfg(unix)]
+const SUDO_UNTRIED: u8 = 0;
+#[cfg(unix)]
+const SUDO_WORKS: u8 = 1;
+#[cfg(unix)]
+const SUDO_OFF: u8 = 2;
+
+/// sudo's message when `-n` keeps it from running a command: there's no
+/// NOPASSWD rule for it, or the user may not use sudo at all.
+#[cfg(unix)]
+fn sudo_refused(stderr: &str) -> bool {
+    let e = stderr.to_ascii_lowercase();
+    ["password is required", "not in the sudoers", "not allowed to", "may not run sudo", "terminal is required"]
+        .iter()
+        .any(|m| e.contains(m))
+}
 
 /// The drive temperature from wherever this smartctl/drive pair reports it.
 fn find_temp(v: &Value) -> Option<f64> {
@@ -515,6 +607,37 @@ mod tests {
         assert_eq!(d.note.as_deref(), Some("unknown USB bridge"));
         apply(&mut d, &Value::Null);
         assert_eq!(d.note.as_deref(), Some("smartctl output unreadable (v7+ needed)"));
+    }
+
+    #[test]
+    fn poll_spacing() {
+        let mut d = Disk::new("/dev/ada0".into(), Some("atacam".into()));
+        d.temp = Some(35.0);
+        d.note = None;
+        let none = SudoUse::default();
+        let via_sudo = SudoUse { tried: true, ran: true, denied: false };
+        assert_eq!(next_wait(&d, none), POLL);
+        assert_eq!(next_wait(&d, via_sudo), SUDO_POLL);
+        // Refused for this disk's arguments, or no temperature with any type.
+        let mut root = Disk::new("/dev/da0".into(), None);
+        root.note = Some("needs root".into());
+        assert_eq!(next_wait(&root, none), POLL);
+        assert_eq!(next_wait(&root, SudoUse { tried: true, ran: false, denied: true }), RETRY_FAILED);
+        let mut virt = Disk::new("/dev/vtbd0".into(), None);
+        virt.note = Some("drive reports no temperature".into());
+        assert_eq!(next_wait(&virt, none), RETRY_FAILED);
+        virt.note = Some("standby".into());
+        assert_eq!(next_wait(&virt, none), POLL);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sudo_refusals() {
+        assert!(sudo_refused("sudo: a password is required\n"));
+        assert!(sudo_refused("alice is not in the sudoers file.\n"));
+        assert!(sudo_refused("Sorry, user alice is not allowed to execute '/usr/sbin/smartctl -s on /dev/sda' as root"));
+        assert!(!sudo_refused(""));
+        assert!(!sudo_refused("smartctl: /dev/sda: Input/output error"));
     }
 
     #[test]

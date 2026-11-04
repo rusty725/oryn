@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
 """Write LICENSES-dependencies.txt: the license notices of every Rust crate
 compiled into the oryn binary, as their licenses require for binary
-packages (.deb, .rpm, pacman). Run from the repository root after changing
-dependencies:  python3 pkg/gen-dep-licenses.py
+packages (.deb, .rpm, pacman, FreeBSD pkg). Run from the repository root
+after changing dependencies:
+
+    python3 pkg/gen-dep-licenses.py [TARGET [OUTPUT]]
+
+TARGET is the Rust target triple the binary is built for (default: the
+host's, from `rustc -vV`), since some crates are only compiled in on some
+platforms. OUTPUT defaults to LICENSES-dependencies.txt, the copy the
+Linux packages ship (on another host, pass x86_64-unknown-linux-gnu for
+it); the FreeBSD package build writes its own for the FreeBSD target.
 """
 import hashlib, json, os, re, subprocess, sys
 
-TARGET = sys.argv[1] if len(sys.argv) > 1 else "x86_64-unknown-linux-gnu"
+def host_target():
+    out = subprocess.run(["rustc", "-vV"], check=True, capture_output=True, text=True).stdout
+    return next(l.split(":", 1)[1].strip() for l in out.splitlines() if l.startswith("host:"))
+
+TARGET = sys.argv[1] if len(sys.argv) > 1 else host_target()
+OUTPUT = sys.argv[2] if len(sys.argv) > 2 else "LICENSES-dependencies.txt"
 
 tree = subprocess.run(
     ["cargo", "tree", "-e", "normal", "--target", TARGET, "--prefix", "none", "--format", "{p}"],
@@ -49,5 +62,5 @@ if missing:
     out += ["", "No license file shipped (license as declared above):"] + missing
 for t, crates in texts.values():
     out += ["", "", "-" * 78, "Used by: " + ", ".join(crates), "-" * 78, "", t]
-open("LICENSES-dependencies.txt", "w", encoding="utf-8").write("\n".join(out) + "\n")
-print(f"{len(rows)} crates, {len(texts)} distinct license texts, {len(missing)} without a file")
+open(OUTPUT, "w", encoding="utf-8").write("\n".join(out) + "\n")
+print(f"{OUTPUT} ({TARGET}): {len(rows)} crates, {len(texts)} distinct license texts, {len(missing)} without a file")

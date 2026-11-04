@@ -26,10 +26,9 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    symbols,
     text::{Line, Span},
     widgets::{
-        Axis, Block, BorderType, Cell, Chart, Clear, Dataset, GraphType, List, ListItem,
+        Block, BorderType, Cell, Clear, List, ListItem,
         ListState, Paragraph, Row, Table, TableState,
     },
     DefaultTerminal, Frame,
@@ -39,6 +38,7 @@ use ratatui::{
 #[cfg_attr(target_os = "freebsd", allow(dead_code))]
 mod devnames;
 mod battery;
+mod cmd;
 #[cfg(target_os = "freebsd")]
 mod freebsd;
 mod gpu;
@@ -46,6 +46,7 @@ mod gpustats;
 mod memprobe;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod nvapi;
+mod linegraph;
 mod panels;
 mod power;
 mod procctl;
@@ -247,7 +248,8 @@ fn format_saved(show: &[bool; NP], lay: &PanelLayout) -> String {
     parts.join(",")
 }
 
-const HISTORY_LEN: usize = 120;
+/// Temperature samples kept per sensor, for the history graph (one per column).
+const HISTORY_LEN: usize = 600;
 const DEFAULT_WARN: f32 = 70.0;
 const DEFAULT_CRIT: f32 = 90.0;
 
@@ -606,12 +608,12 @@ impl App {
         self.pv.select(&self.stats.procs, &vis, cur + delta);
     }
 
-    /// The selected process (pid, name), if any.
-    fn proc_selected(&self) -> Option<(u32, String)> {
+    /// The selected process (pid, name, start time), if any.
+    fn proc_selected(&self) -> Option<(u32, String, u64)> {
         let vis = self.pv.visible(&self.stats.procs);
         let c = self.pv.cursor(&self.stats.procs, &vis)?;
         let p = &self.stats.procs[vis[c]];
-        Some((p.pid, p.name.clone()))
+        Some((p.pid, p.name.clone(), p.start))
     }
 
     /// Keys for the focused process list. Returns false if not handled here.
@@ -630,15 +632,16 @@ impl App {
             KeyCode::Char('e') => self.pv.prompt = Some(Prompt::Exec(String::new())),
             KeyCode::Char(c @ ('t' | 'k')) => {
                 let sig = if c == 't' { procctl::Sig::Term } else { procctl::Sig::Kill };
-                if let Some((pid, name)) = self.proc_selected() {
-                    self.pv.prompt = Some(Prompt::Confirm { sig, pid, name });
+                if let Some((pid, name, start)) = self.proc_selected() {
+                    // Pinned to this very process: see the re-check on confirm.
+                    self.pv.prompt = Some(Prompt::Confirm { sig, pid, name, start });
                 }
             }
             KeyCode::Char('n') => {
-                if let Some((pid, name)) = self.proc_selected() {
+                if let Some((pid, name, start)) = self.proc_selected() {
                     let cur = self.stats.procs.iter().find(|p| p.pid == pid).and_then(|p| p.nice);
                     let buf = cur.map(|n| n.to_string()).unwrap_or_default();
-                    self.pv.prompt = Some(Prompt::Nice { pid, name, buf });
+                    self.pv.prompt = Some(Prompt::Nice { pid, name, start, buf });
                 }
             }
             // Esc first clears an active search; otherwise it quits as usual.
@@ -688,10 +691,13 @@ impl App {
                     self.pv.prompt = Some(Prompt::Exec(buf));
                 }
             },
-            Prompt::Nice { pid, name, mut buf } => match key.code {
+            Prompt::Nice { pid, name, start, mut buf } => match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Enter => match buf.trim().parse::<i32>() {
-                    Ok(v) => match procctl::renice(pid, v) {
+                    Ok(v) => match recheck(pid, &name, start)
+                        .map_err(|_| format!("{name} (pid {pid}) has exited; nice not changed"))
+                        .and_then(|()| procctl::renice(pid, v))
+                    {
                         Ok(()) => {
                             self.pv.set_status(format!("{name} ({pid}) nice → {v}"), false);
                             self.stats.update_nice(pid);
@@ -704,17 +710,19 @@ impl App {
                     // Step the value with the arrows.
                     let v = buf.trim().parse::<i32>().unwrap_or(0) + if key.code == KeyCode::Up { 1 } else { -1 };
                     buf = v.clamp(-20, 19).to_string();
-                    self.pv.prompt = Some(Prompt::Nice { pid, name, buf });
+                    self.pv.prompt = Some(Prompt::Nice { pid, name, start, buf });
                 }
                 _ => {
                     edit(&mut buf, &|c| c.is_ascii_digit() || (c == '-'));
-                    self.pv.prompt = Some(Prompt::Nice { pid, name, buf });
+                    self.pv.prompt = Some(Prompt::Nice { pid, name, start, buf });
                 }
             },
-            Prompt::Confirm { sig, pid, name } => {
+            Prompt::Confirm { sig, pid, name, start } => {
                 if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter) {
                     let what = if sig == procctl::Sig::Term { "terminated" } else { "killed" };
-                    match procctl::signal(pid, sig) {
+                    // Only to the process the prompt was opened for, never to
+                    // a new one that got its PID meanwhile.
+                    match recheck(pid, &name, start).and_then(|()| procctl::signal(pid, sig)) {
                         Ok(()) => {
                             self.pv.set_status(format!("{what} {name} ({pid})"), false);
                             // Give it a moment to exit, then drop it from the list.
@@ -753,22 +761,17 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 if in_proc {
                     self.focus_proc = true;
-                    if m.row >= self.pv.first_row_y {
-                        let row = self.pv.offset + (m.row - self.pv.first_row_y) as usize;
-                        let vis = self.pv.visible(&self.stats.procs);
-                        if row < vis.len() {
-                            self.pv.select(&self.stats.procs, &vis, row as isize);
-                        }
+                    let vis = self.pv.visible(&self.stats.procs);
+                    if let Some(row) = row_at(m.row, self.pv.first_row_y, self.pv.page, self.pv.offset, vis.len()) {
+                        self.pv.select(&self.stats.procs, &vis, row as isize);
                     }
                 } else if in_table {
                     self.focus_proc = false;
-                    // Border, then header, then rows.
+                    // Border, then header, then rows, then the bottom border.
                     let first = self.table_rect.y + 2;
-                    if m.row >= first {
-                        let row = self.table.offset() + (m.row - first) as usize;
-                        if row < self.order.len() {
-                            self.table.select(Some(row));
-                        }
+                    let shown = self.table_rect.height.saturating_sub(3) as usize;
+                    if let Some(row) = row_at(m.row, first, shown, self.table.offset(), self.order.len()) {
+                        self.table.select(Some(row));
                     }
                 }
             }
@@ -2492,6 +2495,22 @@ fn ellipsize(s: &str, w: usize) -> String {
     }
 }
 
+/// Is `pid` still the process (`name`, `start`) a prompt was opened for?
+/// See [`procctl::still_running`].
+fn recheck(pid: u32, name: &str, start: u64) -> Result<(), String> {
+    let now = procctl::lookup(pid);
+    procctl::still_running(pid, name, start, now.as_ref().map(|(n, s)| (n.as_str(), *s)))
+}
+
+/// The list row under a click on screen row `y`, for a list whose rows
+/// start at screen row `first` with `shown` of them on screen, scrolled by
+/// `offset` and `len` long. None on the header, the borders (where hidden
+/// rows would be) and past the end.
+fn row_at(y: u16, first: u16, shown: usize, offset: usize, len: usize) -> Option<usize> {
+    let i = y.checked_sub(first)? as usize;
+    (i < shown).then_some(offset + i).filter(|&row| row < len)
+}
+
 fn trend_arrow(h: &VecDeque<f32>, th: &Theme) -> Span<'static> {
     let n = h.len();
     if n < 6 {
@@ -2516,94 +2535,72 @@ fn draw_chart(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let unit = app.unit;
-    let data: Vec<(f64, f64)> = s
-        .history
-        .iter()
-        .enumerate()
-        .map(|(i, &t)| ((i + HISTORY_LEN - s.history.len()) as f64, unit.conv(t) as f64))
-        .collect();
+    let data: Vec<f64> = s.history.iter().map(|&t| unit.conv(t) as f64).collect();
 
     let warn = unit.conv(s.warn_threshold()) as f64;
     let crit = unit.conv(s.crit_threshold()) as f64;
-    let warn_line: Vec<(f64, f64)> = vec![(0.0, warn), (HISTORY_LEN as f64, warn)];
-    let crit_line: Vec<(f64, f64)> = vec![(0.0, crit), (HISTORY_LEN as f64, crit)];
 
-    let (lo, hi) = data.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &(_, y)| {
-        (lo.min(y), hi.max(y))
-    });
+    // The range of what is on screen (the plot is narrower than `area`).
+    let shown = &data[data.len().saturating_sub(area.width as usize)..];
+    let (lo, hi) = shown.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &y| (lo.min(y), hi.max(y)));
     let (lo, hi) = if data.is_empty() { (0.0, 100.0) } else { (lo, hi) };
     // Show the warn line if we're anywhere near it; pad the range a bit.
     let y_min = (lo - 5.0).floor();
     let y_max = (hi.max(warn.min(hi + 15.0)) + 5.0).ceil();
 
     let line_color = s.current.map(|t| s.level(t).color(&th)).unwrap_or(th.dim);
-    let mut datasets = vec![Dataset::default()
-        .name(s.label.clone())
-        .marker(symbols::Marker::Braille)
-        .graph_type(GraphType::Line)
-        .style(Style::new().fg(line_color))
-        .data(&data)];
-    if warn <= y_max {
-        datasets.push(
-            Dataset::default()
-                .name("warn")
-                .marker(symbols::Marker::Dot)
-                .graph_type(GraphType::Line)
-                .style(Style::new().fg(th.warn).add_modifier(Modifier::DIM))
-                .data(&warn_line),
-        );
-    }
-    if crit <= y_max {
-        datasets.push(
-            Dataset::default()
-                .name("crit")
-                .marker(symbols::Marker::Dot)
-                .graph_type(GraphType::Line)
-                .style(Style::new().fg(th.crit).add_modifier(Modifier::DIM))
-                .data(&crit_line),
-        );
-    }
-
-    let secs = |samples: f64| (samples * app.interval.as_secs_f64()).round() as i64;
-    let x_labels = vec![
-        Span::raw(format!("-{}s", secs(HISTORY_LEN as f64))),
-        Span::raw(format!("-{}s", secs(HISTORY_LEN as f64 / 2.0))),
-        Span::raw("now"),
-    ];
     let sym = match unit {
         Unit::C => "°C",
         Unit::F => "°F",
     };
-    let y_labels = vec![
-        Span::raw(format!("{:.0}{sym}", y_min)),
-        Span::raw(format!("{:.0}{sym}", (y_min + y_max) / 2.0)),
-        Span::raw(format!("{:.0}{sym}", y_max)),
+    let y_labels = [
+        format!("{:.0}{sym}", y_max),
+        format!("{:.0}{sym}", (y_min + y_max) / 2.0),
+        format!("{:.0}{sym}", y_min),
     ];
 
-    let chart = Chart::new(datasets)
-        .block(panels::block(
-            &th,
-            P_HISTORY + 1,
-            vec![
-                Span::raw(format!("history · {} · {} ", s.device, s.label)),
-                Span::styled("·· warn ", Style::new().fg(th.warn)),
-                Span::styled("·· crit ", Style::new().fg(th.crit)),
-            ],
-        ))
-        .legend_position(None)
-        .x_axis(
-            Axis::default()
-                .bounds([0.0, HISTORY_LEN as f64])
-                .labels(x_labels)
-                .style(Style::new().fg(th.dim)),
-        )
-        .y_axis(
-            Axis::default()
-                .bounds([y_min, y_max])
-                .labels(y_labels)
-                .style(Style::new().fg(th.dim)),
-        );
-    f.render_widget(chart, area);
+    let b = panels::block(
+        &th,
+        P_HISTORY + 1,
+        vec![
+            Span::raw(format!("history · {} · {} ", s.device, s.label)),
+            Span::styled("┄┄ warn ", Style::new().fg(th.warn)),
+            Span::styled("┄┄ crit ", Style::new().fg(th.crit)),
+        ],
+    );
+    let inner = b.inner(area);
+    f.render_widget(b, area);
+    // The time labels get the bottom row when there is room for a graph too.
+    let x_row = u16::from(inner.height >= 3);
+    let graph = Rect { height: inner.height - x_row, ..inner };
+    let buf = f.buffer_mut();
+    let plot = linegraph::y_axis(buf, graph, &y_labels, &th);
+    // Thresholds as dashed lines (drawn only inside y_min..y_max), the
+    // temperature over them in the color of its current level.
+    let marks = [(warn, th.warn), (crit, th.crit)];
+    linegraph::graph(buf, plot, &[(&data, &|_, _| line_color)], (y_min, y_max), &marks, &th);
+
+    if x_row == 1 && plot.width > 0 && !data.is_empty() {
+        let (w, [left, mid]) = time_labels(data.len(), plot.width, app.interval);
+        let r = Rect { x: plot.x + plot.width - w, y: graph.y + graph.height, width: w, height: 1 };
+        linegraph::x_labels(buf, r, [&left, &mid, "now"], Style::new().fg(th.dim));
+    }
+}
+
+/// Time labels under a history graph `plot_w` columns wide that holds
+/// `samples` samples taken `interval` apart (one per column, the newest on
+/// the right): how many columns at the right they span (the ones with
+/// samples, at least room for "now") and the oldest and middle ages. Only
+/// history that exists is labelled: the leftmost of `n` columns is `n - 1`
+/// samples old.
+fn time_labels(samples: usize, plot_w: u16, interval: Duration) -> (u16, [String; 2]) {
+    let n = samples.min(plot_w as usize);
+    let age = |k: f64| format!("-{}s", (k * interval.as_secs_f64()).round() as i64);
+    if n < 3 {
+        // No room for an age next to "now".
+        return (plot_w.min(3), [String::new(), String::new()]);
+    }
+    (n as u16, [age((n - 1) as f64), age((n - 1) as f64 / 2.0)])
 }
 
 #[cfg(test)]
@@ -2655,6 +2652,29 @@ mod tests {
         assert_eq!(step_interval(ms(250), -1), ms(200));
     }
 
+    #[test]
+    fn history_time_labels_only_claim_what_exists() {
+        let s = Duration::from_secs(1);
+        // Wide plot, full history: the leftmost column is width-1 samples old.
+        assert_eq!(time_labels(600, 80, s), (80, ["-79s".into(), "-40s".into()]));
+        // Ten samples on an 80-column plot: labels over those ten columns.
+        assert_eq!(time_labels(10, 80, s), (10, ["-9s".into(), "-5s".into()]));
+        assert_eq!(time_labels(5, 80, Duration::from_millis(500)), (5, ["-2s".into(), "-1s".into()]));
+        // Too few for an age: room for "now" only.
+        assert_eq!(time_labels(1, 80, s), (3, [String::new(), String::new()]));
+        assert_eq!(time_labels(1, 2, s).0, 2);
+    }
+
+    #[test]
+    fn click_rows() {
+        // Rows from screen row 10, 5 on screen, scrolled by 20, 100 long.
+        assert_eq!(row_at(9, 10, 5, 20, 100), None); // header
+        assert_eq!(row_at(10, 10, 5, 20, 100), Some(20));
+        assert_eq!(row_at(14, 10, 5, 20, 100), Some(24));
+        assert_eq!(row_at(15, 10, 5, 20, 100), None); // bottom border: row 25 is hidden
+        assert_eq!(row_at(12, 10, 5, 20, 22), None); // past the end
+        assert_eq!(row_at(10, 10, 0, 0, 100), None);
+    }
     #[test]
     fn core_ranges() {
         assert_eq!(ranges(&[0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23]), "C0–7, C16–23");
@@ -2709,8 +2729,8 @@ mod render_fuzz {
             a.pv.prompt = match combo % 5 {
                 1 => Some(panels::Prompt::Filter),
                 2 => Some(panels::Prompt::Exec("x".repeat(300))),
-                3 => Some(panels::Prompt::Nice { pid: 1, name: "n".repeat(50), buf: "-5".into() }),
-                4 => Some(panels::Prompt::Confirm { sig: procctl::Sig::Kill, pid: 1, name: "zz".into() }),
+                3 => Some(panels::Prompt::Nice { pid: 1, name: "n".repeat(50), start: 0, buf: "-5".into() }),
+                4 => Some(panels::Prompt::Confirm { sig: procctl::Sig::Kill, pid: 1, name: "zz".into(), start: 0 }),
                 _ => None,
             };
             a.pv.filter = if combo % 4 == 1 { "zzzz-no-match".into() } else { String::new() };
@@ -2801,6 +2821,61 @@ mod render_fuzz {
         assert!(h.contains(" BAT  54% 2h 10m left 8.4 W"), "{h}");
         assert!(h.contains(concat!(" ·  v", env!("CARGO_PKG_VERSION"))), "version after the clock: {h}");
     }
+
+    #[test]
+    fn clicks_on_the_bottom_border_select_nothing() {
+        let mut a = app();
+        let mut t = Terminal::new(TestBackend::new(160, 160)).unwrap();
+        t.draw(|f| draw(f, &mut a)).unwrap();
+        let click = |a: &mut App, column, row| {
+            a.mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        for r in [a.proc_rect, a.table_rect] {
+            assert!(r.height >= 5, "{r:?}");
+            let vis = a.pv.visible(&a.stats.procs);
+            a.pv.select(&a.stats.procs, &vis, 0);
+            a.table.select(Some(0));
+            click(&mut a, r.x + 3, r.y + r.height - 1);
+            assert_eq!((a.pv.sel_idx, a.table.selected()), (0, Some(0)), "{r:?}");
+            // The row above it is the last one on screen.
+            click(&mut a, r.x + 3, r.y + r.height - 2);
+            let (n, sel) = if r == a.proc_rect {
+                (vis.len(), a.pv.sel_idx)
+            } else {
+                (a.order.len(), a.table.selected().unwrap())
+            };
+            assert_eq!(sel, if n > r.height as usize - 4 { r.height as usize - 4 } else { 0 }, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn confirm_refuses_once_the_process_is_gone() {
+        let mut a = app();
+        let y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        // Nothing runs as this PID (any more).
+        let ghost = i32::MAX as u32 - 7;
+        a.pv.prompt = Some(panels::Prompt::Confirm { sig: procctl::Sig::Kill, pid: ghost, name: "ghost".into(), start: 1 });
+        a.prompt_key(y);
+        let (msg, err, _) = a.pv.status.clone().unwrap();
+        assert_eq!((msg.as_str(), err), (format!("ghost (pid {ghost}) has exited; nothing sent").as_str(), true));
+        // A running PID with another start time is another process.
+        let me = std::process::id();
+        let (name, start) = procctl::lookup(me).unwrap();
+        a.pv.prompt = Some(panels::Prompt::Confirm { sig: procctl::Sig::Term, pid: me, name: name.clone(), start: start + 1 });
+        a.prompt_key(y);
+        assert!(a.pv.status.clone().unwrap().0.ends_with("has exited; nothing sent"));
+        let nice_before = procctl::nice_of(me);
+        a.pv.prompt = Some(panels::Prompt::Nice { pid: me, name, start: start + 1, buf: "5".into() });
+        a.prompt_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.pv.status.clone().unwrap().0.ends_with("has exited; nice not changed"));
+        assert_eq!(procctl::nice_of(me), nice_before);
+    }
+
 }
 
 #[cfg(test)]

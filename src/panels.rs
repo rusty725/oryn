@@ -4,14 +4,14 @@
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    symbols,
     text::{Line, Span},
-    widgets::{Axis, Block, BorderType, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table},
+    widgets::{Block, BorderType, Cell, Paragraph, Row, Table},
     Frame,
 };
 
 use crate::ellipsize;
-use crate::sysstats::{human, human_bits, SysStats, HIST};
+use crate::linegraph;
+use crate::sysstats::{human, human_bits, SysStats};
 use crate::themes::Theme;
 
 const SUP: [&str; 10] = ["⁰", "¹", "²", "³", "⁴", "⁵", "⁶", "⁷", "⁸", "⁹"];
@@ -47,11 +47,24 @@ fn meter(frac: f64, width: usize, color: Color, th: &Theme) -> Vec<Span<'static>
     ]
 }
 
-/// Top of a usage graph (percent): zoomed in when usage is low so small
-/// changes show, but never below 10 %.
-fn graph_top(hist: &std::collections::VecDeque<f32>) -> f64 {
-    let peak = hist.iter().copied().fold(0.0f32, f32::max);
+/// Top of a usage graph (percent) over the newest `n` samples (the ones on
+/// screen): zoomed in when usage is low so small changes show, but never
+/// below 10 %.
+fn graph_top(hist: &std::collections::VecDeque<f32>, n: usize) -> f64 {
+    let peak = hist.iter().rev().take(n).copied().fold(0.0f32, f32::max);
     if peak < 10.0 { 10.0 } else if peak < 25.0 { 25.0 } else if peak < 50.0 { 50.0 } else { 100.0 }
+}
+
+/// A usage history (percent) as a line graph in `area`: labels "0%" and the
+/// zoomed top ([`graph_top`]) left of the axis, one sample per column.
+fn usage_graph(f: &mut Frame, area: Rect, hist: &std::collections::VecDeque<f32>, color: Color, th: &Theme) {
+    let pts: Vec<f64> = hist.iter().map(|v| *v as f64).collect();
+    // The plot is a little narrower than `area` (labels and axis), so this
+    // covers every sample on screen.
+    let top = graph_top(hist, area.width as usize);
+    let buf = f.buffer_mut();
+    let plot = linegraph::y_axis(buf, area, &[format!("{top:>3.0}%"), "  0%".into()], th);
+    linegraph::graph(buf, plot, &[(&pts, &|_, _| color)], (0.0, top), &[], th);
 }
 
 fn pct_of(part: u64, total: u64) -> f64 {
@@ -112,7 +125,9 @@ fn core_cols(inner_w: u16, temps: &CpuTemps) -> usize {
 pub fn cpu_height(width: u16, cores: usize, temps: &CpuTemps) -> u16 {
     let cols = core_cols(width.saturating_sub(2), temps);
     let rows = cores.div_ceil(cols).max(1) as u16;
-    2 + 1 + temps.has_line() as u16 + 2 + rows
+    // borders, total line, temperatures, the usage graph (4 rows: a line
+    // graph; fewer would fall back to braille dots), the core rows.
+    2 + 1 + temps.has_line() as u16 + 4 + rows
 }
 
 /// Same rule as the sensor table: crit at the sensor's critical temperature,
@@ -240,28 +255,8 @@ pub fn draw_cpu(
     line.push(Span::styled(load, Style::new().fg(th.dim)));
     f.render_widget(Paragraph::new(Line::from(line)), total);
 
-    // Usage history as a braille line (still visible at 1%), 0–100 %.
-    let off = HIST.saturating_sub(s.cpu_hist.len());
-    let pts: Vec<(f64, f64)> =
-        s.cpu_hist.iter().enumerate().map(|(i, v)| ((i + off) as f64, *v as f64)).collect();
-    let top = graph_top(&s.cpu_hist);
-    let chart = Chart::new(vec![
-        Dataset::default()
-            .marker(symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(th.accent))
-            .data(&pts),
-    ])
-    .x_axis(Axis::default().bounds([0.0, HIST as f64]))
-    .y_axis(
-        Axis::default()
-            .bounds([0.0, top])
-            .labels(vec![
-                Span::styled("  0%", Style::new().fg(th.dim)),
-                Span::styled(format!("{top:>3.0}%"), Style::new().fg(th.dim)),
-            ]),
-    );
-    f.render_widget(chart, spark);
+    // Usage history as a line graph, zoomed in when usage is low.
+    usage_graph(f, spark, &s.cpu_hist, th.accent, th);
 
     // Per-core grid.
     let mut lines: Vec<Line> = Vec::new();
@@ -403,26 +398,16 @@ pub fn draw_net(f: &mut Frame, area: Rect, s: &SysStats, th: &Theme, key: usize)
 
     let [graph, stats] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(26)]).areas(inner);
 
-    // Download above the axis, upload mirrored below it, like btop.
-    let off = HIST.saturating_sub(n.rx_hist.len());
-    let rx: Vec<(f64, f64)> = n.rx_hist.iter().enumerate().map(|(i, v)| ((i + off) as f64, *v)).collect();
-    let tx: Vec<(f64, f64)> = n.tx_hist.iter().enumerate().map(|(i, v)| ((i + off) as f64, -*v)).collect();
-    let peak = n.rx_hist.iter().chain(n.tx_hist.iter()).cloned().fold(1024.0, f64::max) * 1.1;
-    let chart = Chart::new(vec![
-        Dataset::default().marker(symbols::Marker::Braille).graph_type(GraphType::Line).style(Style::new().fg(th.cool)).data(&rx),
-        Dataset::default().marker(symbols::Marker::Braille).graph_type(GraphType::Line).style(Style::new().fg(th.hot)).data(&tx),
-    ])
-    .x_axis(Axis::default().bounds([0.0, HIST as f64]))
-    .y_axis(
-        Axis::default()
-            .bounds([-peak, peak])
-            .labels(vec![
-                Span::styled(format!("{}/s", short(peak)), Style::new().fg(th.dim)),
-                Span::raw(""),
-                Span::styled(format!("{}/s", short(peak)), Style::new().fg(th.dim)),
-            ]),
-    );
-    f.render_widget(chart, graph);
+    // Download and upload as two lines on one graph, from 0 up to the peak.
+    let rx: Vec<f64> = n.rx_hist.iter().copied().collect();
+    let tx: Vec<f64> = n.tx_hist.iter().copied().collect();
+    // The peak of what is on screen: the plot is narrower than `graph`.
+    let shown = graph.width as usize;
+    let peak = n.rx_hist.iter().rev().take(shown).chain(n.tx_hist.iter().rev().take(shown)).cloned().fold(1024.0, f64::max) * 1.1;
+    let buf = f.buffer_mut();
+    let plot = linegraph::y_axis(buf, graph, &[format!("{}/s", short(peak)), "0".into()], th);
+    let (cool, hot) = (th.cool, th.hot);
+    linegraph::graph(buf, plot, &[(&rx, &|_, _| cool), (&tx, &|_, _| hot)], (0.0, peak), &[], th);
 
     let dl = Style::new().fg(th.cool).add_modifier(Modifier::BOLD);
     let ul = Style::new().fg(th.hot).add_modifier(Modifier::BOLD);
@@ -452,10 +437,13 @@ pub enum Prompt {
     Filter,
     /// Typing a command line to start.
     Exec(String),
-    /// Typing a new nice value for a process.
-    Nice { pid: u32, name: String, buf: String },
+    /// Typing a new nice value for a process (`start`: its start time, see
+    /// `ProcInfo::start`).
+    Nice { pid: u32, name: String, start: u64, buf: String },
     /// "terminate/kill PID name? (y/n)".
-    Confirm { sig: crate::procctl::Sig, pid: u32, name: String },
+    /// The process is pinned when the prompt opens (`start`: its start
+    /// time): if it exits meanwhile, nothing is sent to whatever gets its PID.
+    Confirm { sig: crate::procctl::Sig, pid: u32, name: String, start: u64 },
 }
 
 /// Selection, scrolling, search and prompt state of the process panel.
@@ -687,13 +675,13 @@ fn action_bar(pv: &ProcView, th: &Theme, width: usize) -> Line<'static> {
             caret,
             Span::styled("  ↵ start │ esc cancel ", dim),
         ],
-        Some(Prompt::Nice { pid, name, buf }) => vec![
+        Some(Prompt::Nice { pid, name, buf, .. }) => vec![
             Span::styled(format!(" nice for {pid} {name} (-20…19): "), key),
             Span::styled(buf.clone(), txt),
             caret,
             Span::styled("  ↵ set │ esc cancel ", dim),
         ],
-        Some(Prompt::Confirm { sig, pid, name }) => {
+        Some(Prompt::Confirm { sig, pid, name, .. }) => {
             let verb = match sig {
                 crate::procctl::Sig::Term => "terminate (SIGTERM)",
                 crate::procctl::Sig::Kill => "kill (SIGKILL)",
@@ -774,8 +762,9 @@ fn action_bar(pv: &ProcView, th: &Theme, width: usize) -> Line<'static> {
 // GPU
 // ---------------------------------------------------------------------------
 
-/// Rows per GPU: usage line, graph (≥2), VRAM line, stats line.
-const GPU_ROWS: u16 = 1 + 2 + 1 + 1;
+/// Rows per GPU: usage line, graph (4: tall enough for a line graph rather
+/// than braille dots), VRAM line, stats line.
+const GPU_ROWS: u16 = 1 + 4 + 1 + 1;
 
 /// Width of one "A0 56°C" cell in the VRAM chip rows, for these labels.
 fn chip_cell_w(chips: &[(String, f32)]) -> usize {
@@ -858,24 +847,7 @@ fn draw_one_gpu(f: &mut Frame, area: Rect, g: &crate::gpustats::GpuView, show_na
     f.render_widget(Paragraph::new(Line::from(line)), usage);
 
     // Usage history, same zooming line graph as the CPU panel.
-    let off = HIST.saturating_sub(g.hist.len());
-    let pts: Vec<(f64, f64)> = g.hist.iter().enumerate().map(|(i, v)| ((i + off) as f64, *v as f64)).collect();
-    let top = graph_top(&g.hist);
-    let chart = Chart::new(vec![
-        Dataset::default()
-            .marker(symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::new().fg(crate::themes::kind_color("GPU", th)))
-            .data(&pts),
-    ])
-    .x_axis(Axis::default().bounds([0.0, HIST as f64]))
-    .y_axis(
-        Axis::default().bounds([0.0, top]).labels(vec![
-            Span::styled("  0%", Style::new().fg(th.dim)),
-            Span::styled(format!("{top:>3.0}%"), Style::new().fg(th.dim)),
-        ]),
-    );
-    f.render_widget(chart, graph);
+    usage_graph(f, graph, &g.hist, crate::themes::kind_color("GPU", th), th);
 
     // VRAM.
     if let (Some(used), Some(total)) = (g.vram_used, g.vram_total) {
@@ -1042,5 +1014,55 @@ mod tests {
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Temp 44°C (iGPU)"), "{text}");
         assert!(text.contains("Core idle"), "{text}");
+    }
+
+    #[test]
+    fn graph_top_zooms_on_the_samples_shown() {
+        // A spike long scrolled off the left edge no longer zooms out.
+        let mut h: std::collections::VecDeque<f32> = std::iter::repeat_n(3.0, 600).collect();
+        h[10] = 90.0;
+        assert_eq!(graph_top(&h, 100), 10.0);
+        assert_eq!(graph_top(&h, 600), 100.0);
+        h[599] = 30.0;
+        assert_eq!(graph_top(&h, 1), 50.0);
+        assert_eq!(graph_top(&std::collections::VecDeque::new(), 80), 10.0);
+    }
+
+    /// Box-drawing line cells and braille cells in a drawn buffer.
+    fn glyphs(buf: &ratatui::buffer::Buffer) -> (usize, usize) {
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        // (Not ╭╮╰╯: the panel border has those corners too.)
+        let lines = text.chars().filter(|c| "●┈".contains(*c)).count();
+        let dots = text.chars().filter(|c| ('\u{2801}'..='\u{28ff}').contains(c)).count();
+        (lines, dots)
+    }
+
+    #[test]
+    fn short_gpu_graph_uses_braille_tall_one_lines() {
+        let hist: std::collections::VecDeque<f32> = (0..300).map(|i| (i * 7 % 60) as f32).collect();
+        let g = crate::gpustats::GpuView { name: "GPU".into(), util: Some(40.0), hist, ..Default::default() };
+        let th = crate::themes::THEMES[2];
+        // Borders (2) + usage, VRAM and stats lines (3) + the graph: a 3-row
+        // graph (braille), then an 8-row one (lines).
+        for (h, braille) in [(2 + 3 + 3, true), (2 + 3 + 8, false)] {
+            let mut term = Terminal::new(TestBackend::new(80, h)).unwrap();
+            term.draw(|f| draw_gpu(f, f.area(), std::slice::from_ref(&g), &th, 8, false)).unwrap();
+            let (lines, dots) = glyphs(term.backend().buffer());
+            assert_eq!((lines == 0, dots > 0), (braille, braille), "height {h}: lines {lines}, dots {dots}");
+        }
+    }
+
+    #[test]
+    fn cpu_panel_at_its_own_height_draws_lines() {
+        let mut s = SysStats::new();
+        s.cpu_cores = vec![10.0; 16];
+        s.cpu_hist = (0..300).map(|i| (i * 7 % 60) as f32).collect();
+        let temps = CpuTemps::default();
+        let th = crate::themes::THEMES[2];
+        let h = cpu_height(120, s.cpu_cores.len(), &temps);
+        let mut term = Terminal::new(TestBackend::new(120, h)).unwrap();
+        term.draw(|f| draw_cpu(f, f.area(), &s, &temps, (None, None), &th, 3)).unwrap();
+        let (lines, dots) = glyphs(term.backend().buffer());
+        assert!(lines > 0 && dots == 0, "height {h}: lines {lines}, dots {dots}");
     }
 }

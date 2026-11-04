@@ -8,7 +8,7 @@
 %global _docdir_fmt %{name}
 
 Name:           oryn
-Version:        0.1.12
+Version:        0.1.13
 Release:        1%{?dist}
 Summary:        Terminal hardware monitor with every temperature sensor
 
@@ -19,8 +19,8 @@ URL:            https://github.com/rusty725/oryn
 Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 
 ExclusiveArch:  x86_64 aarch64
-BuildRequires:  cargo >= 1.85
-BuildRequires:  rust >= 1.85
+BuildRequires:  cargo >= 1.95
+BuildRequires:  rust >= 1.95
 BuildRequires:  gcc
 
 Recommends:     smartmontools
@@ -57,6 +57,16 @@ install -Dm0644 doc/oryn.1 %{buildroot}%{_mandir}/man1/oryn.1
 %{_mandir}/man1/oryn.1*
 
 %changelog
+* Tue Nov 03 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.13-1
+- Line graphs: CPU, GPU, network and temperature histories drawn as lines
+  on a faint grid (600 samples; very short graphs keep braille dots);
+  download and upload as two lines.
+- Kill, terminate and renice re-check the process before signalling.
+- Helper commands time out and are read while running; new disks and
+  interfaces no longer cause a throughput spike.
+- Narrower sudoers suggestions (exact smartctl/dmidecode arguments).
+- Minimum Rust 1.95.
+
 * Sun Oct 18 2026 rusty725 <rusty725@users.noreply.github.com> - 0.1.12-1
 - GPU panel and header no longer show the last NVIDIA figures as live after
   nvidia-smi stops.

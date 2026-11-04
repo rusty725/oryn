@@ -370,6 +370,48 @@ fn tag<'a>(s: &'a str, name: &str) -> Option<&'a str> {
     Some(s[start..start + len].trim())
 }
 
+/// Undo the XML escaping in kern.geom.confxml text ("Smith &amp; Co" ->
+/// "Smith & Co"): the five named entities and numeric ones ("&#38;",
+/// "&#x26;"). Anything else is left as it is.
+fn xml_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let entity = rest.find(';').filter(|&j| j <= 10).and_then(|j| {
+            let c = match &rest[1..j] {
+                "amp" => '&',
+                "lt" => '<',
+                "gt" => '>',
+                "quot" => '"',
+                "apos" => '\'',
+                e => {
+                    let n = e.strip_prefix('#')?;
+                    let v = match n.strip_prefix(['x', 'X']) {
+                        Some(h) => u32::from_str_radix(h, 16).ok()?,
+                        None => n.parse().ok()?,
+                    };
+                    char::from_u32(v)?
+                }
+            };
+            Some((c, j + 1))
+        });
+        match entity {
+            Some((c, len)) => {
+                out.push(c);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn parse_geom_disks(xml: &str) -> Vec<GeomDisk> {
     let Some(class) = xml.split("<class id=").find(|c| tag(c, "name") == Some("DISK")) else {
         return Vec::new();
@@ -385,7 +427,7 @@ fn parse_geom_disks(xml: &str) -> Vec<GeomDisk> {
             }
             let bytes = tag(p, "mediasize")?.parse::<u64>().ok().filter(|b| *b > 0)?;
             Some(GeomDisk {
-                model: tag(p, "descr").filter(|d| !d.is_empty()).map(str::to_string),
+                model: tag(p, "descr").filter(|d| !d.is_empty()).map(xml_unescape),
                 rotational: tag(p, "rotationrate").and_then(|r| r.parse::<u64>().ok()).map(|r| r > 0),
                 bytes,
                 name,
@@ -394,15 +436,32 @@ fn parse_geom_disks(xml: &str) -> Vec<GeomDisk> {
         .collect()
 }
 
-/// The NVMe controller behind an `nda` disk ("nda0" -> "nvme0"), which is
-/// what smartctl wants. The boot log says "nda0 at nvme0 bus 0 …".
-pub fn nvme_controller(nda: &str) -> Option<String> {
+/// The NVMe controller behind an `nda` (or `nvd`) disk ("nda0" -> "nvme0"),
+/// which is what smartctl wants. The attach line "nda0 at nvme0 bus 0 …"
+/// says, in the boot log or, for a drive attached since boot, the kernel
+/// message buffer. nda and nvd aren't newbus devices (there is no
+/// dev.nda.N.%parent), so without that line only a machine with a single
+/// controller gives a sure answer; numbers alone can differ.
+pub fn nvme_controller(disk: &str) -> Option<String> {
     let boot = std::fs::read_to_string("/var/run/dmesg.boot").unwrap_or_default();
-    let prefix = format!("{nda} at ");
-    boot.lines()
-        .find_map(|l| l.strip_prefix(&prefix)?.split_whitespace().next().map(str::to_string))
+    attach_parent(&boot, disk)
+        .or_else(|| attach_parent(&sysctl_str("kern.msgbuf").unwrap_or_default(), disk))
+        .or_else(|| {
+            let only_one = sysctl_str("dev.nvme.0.%driver").is_some() && sysctl_str("dev.nvme.1.%driver").is_none();
+            only_one.then(|| "nvme0".to_string())
+        })
+}
+
+/// "nvme0" from the last "nda0 at nvme0 bus 0 scbus8 …" line of a kernel
+/// log (the message buffer puts a "<6>" priority in front of some lines).
+fn attach_parent(log: &str, disk: &str) -> Option<String> {
+    let prefix = format!("{disk} at ");
+    log.lines()
+        .rev()
+        .map(|l| l.strip_prefix('<').and_then(|r| r.split_once('>')).map_or(l, |(_, r)| r))
+        .find_map(|l| l.strip_prefix(&prefix)?.split_whitespace().next())
         .filter(|c| c.starts_with("nvme"))
-        .or_else(|| Some(format!("nvme{}", nda.strip_prefix("nda")?)))
+        .map(str::to_string)
 }
 
 /// A disk's firmware revision, from its attach line in the boot log (no
@@ -429,6 +488,45 @@ fn nvme_disk_name(ctrl: &str) -> Option<String> {
         .map(|d| d.name)
         .filter(|n| n.starts_with("nda") || n.starts_with("nvd"))
         .find(|n| nvme_controller(n).as_deref() == Some(ctrl))
+}
+
+// ---------------------------------------------------------------------------
+// Device reads off the UI thread
+// ---------------------------------------------------------------------------
+
+/// Readings taken on a thread of its own, so a slow device (an NVMe drive
+/// waking from a power state, a busy SMBus) never holds up the screen.
+/// Each `latest()` asks for a fresh sample and returns the newest finished
+/// one; requests that come while a read is running, or sooner than
+/// `min_gap` after the last one, are dropped. The thread ends with it.
+struct Worker {
+    latest: std::sync::Arc<std::sync::Mutex<Vec<Reading>>>,
+    wake: std::sync::mpsc::SyncSender<()>,
+}
+
+impl Worker {
+    fn spawn(first: Vec<Reading>, min_gap: std::time::Duration, mut sample: impl FnMut() -> Vec<Reading> + Send + 'static) -> Self {
+        let latest = std::sync::Arc::new(std::sync::Mutex::new(first));
+        let (wake, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let out = std::sync::Arc::clone(&latest);
+        std::thread::spawn(move || {
+            let mut last = std::time::Instant::now();
+            while rx.recv().is_ok() {
+                if last.elapsed() < min_gap {
+                    continue;
+                }
+                let r = sample();
+                last = std::time::Instant::now();
+                *out.lock().unwrap() = r;
+            }
+        });
+        Self { latest, wake }
+    }
+
+    fn latest(&self) -> Vec<Reading> {
+        let _ = self.wake.try_send(());
+        self.latest.lock().unwrap().clone()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -500,9 +598,17 @@ impl NvmeCtrl {
 /// eight extra sensors, and the drive's own critical limit. Opening
 /// /dev/nvmeN needs root; controllers that can't be opened are left to
 /// the SMART poller (which can still go through `sudo -n smartctl`).
+///
+/// The log is read on a background thread and at most every
+/// [`NVME_POLL`]: each read is an admin command, and asking too often
+/// keeps the drive out of its low-power states (APST).
 pub struct NvmeSource {
-    ctrls: Vec<NvmeCtrl>,
+    paths: std::collections::HashSet<String>,
+    worker: Option<Worker>,
 }
+
+/// Shortest time between two health-log reads of the same drive.
+const NVME_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl NvmeSource {
     pub fn new() -> Self {
@@ -530,43 +636,50 @@ impl NvmeSource {
                 ctrls.push(c);
             }
         }
-        Self { ctrls }
+        let paths = ctrls.iter().map(|c| c.path.clone()).collect();
+        let worker = (!ctrls.is_empty()).then(|| Worker::spawn(nvme_readings(&ctrls), NVME_POLL, move || nvme_readings(&ctrls)));
+        Self { paths, worker }
     }
 
     /// Controllers read here, so the SMART poller can skip them.
     pub fn paths(&self) -> std::collections::HashSet<String> {
-        self.ctrls.iter().map(|c| c.path.clone()).collect()
+        self.paths.clone()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.ctrls.is_empty()
+        self.paths.is_empty()
     }
+}
+
+/// One health-log read of each controller.
+fn nvme_readings(ctrls: &[NvmeCtrl]) -> Vec<Reading> {
+    let mut out = Vec::new();
+    for c in ctrls {
+        let log = c.health_log();
+        let reading = |label: String, temp: Option<f32>, critical: Option<f32>| Reading {
+            id: format!("nvme:{}:{label}", c.path),
+            label: format!("{} {label}", c.name),
+            device: c.model.clone(),
+            temp,
+            critical,
+            cpu: false,
+            kind: "NVME",
+            note: None,
+        };
+        out.push(reading("Composite".into(), log.as_ref().and_then(|l| kelvin_at(l, 1)), c.critical));
+        // Temperature Sensor 1–8 at bytes 200–215; unimplemented ones read 0.
+        for s in 0..8 {
+            if let Some(t) = log.as_ref().and_then(|l| kelvin_at(l, 200 + 2 * s)) {
+                out.push(reading(format!("Sensor {}", s + 1), Some(t), None));
+            }
+        }
+    }
+    out
 }
 
 impl Source for NvmeSource {
     fn read(&mut self) -> Vec<Reading> {
-        let mut out = Vec::new();
-        for c in &self.ctrls {
-            let log = c.health_log();
-            let reading = |label: String, temp: Option<f32>, critical: Option<f32>| Reading {
-                id: format!("nvme:{}:{label}", c.path),
-                label: format!("{} {label}", c.name),
-                device: c.model.clone(),
-                temp,
-                critical,
-                cpu: false,
-                kind: "NVME",
-                note: None,
-            };
-            out.push(reading("Composite".into(), log.as_ref().and_then(|l| kelvin_at(l, 1)), c.critical));
-            // Temperature Sensor 1–8 at bytes 200–215; unimplemented ones read 0.
-            for s in 0..8 {
-                if let Some(t) = log.as_ref().and_then(|l| kelvin_at(l, 200 + 2 * s)) {
-                    out.push(reading(format!("Sensor {}", s + 1), Some(t), None));
-                }
-            }
-        }
-        out
+        self.worker.as_ref().map(Worker::latest).unwrap_or_default()
     }
     fn name(&self) -> &'static str {
         "nvme"
@@ -654,10 +767,10 @@ struct Dimm {
 /// `spd5118` driver: the hub sits at SMBus address 0x50–0x57 and its MR49
 /// register is the stick's temperature. The name comes from the SPD
 /// EEPROM behind the hub (maker + part number). Needs `kldload smb` (for
-/// /dev/smbN) and root.
+/// /dev/smbN) and root. The SMBus is read on a background thread, once per
+/// refresh, so a slow or stuck bus can't hold up the screen.
 pub struct RamSource {
-    buses: Vec<std::fs::File>,
-    dimms: Vec<Dimm>,
+    worker: Option<Worker>,
     /// Shown as a single row when nothing can be read and why is known.
     note: Option<&'static str>,
 }
@@ -708,7 +821,10 @@ impl RamSource {
         if dimms.is_empty() && note.is_none() && has_smbus && sysctl_str("dev.smb.0.%driver").is_none() {
             note = Some("kldload smb");
         }
-        Self { buses, dimms, note }
+        let worker = (!dimms.is_empty()).then(|| {
+            Worker::spawn(ram_readings(&buses, &dimms), std::time::Duration::ZERO, move || ram_readings(&buses, &dimms))
+        });
+        Self { worker, note }
     }
 }
 
@@ -828,45 +944,50 @@ pub fn ram_report() -> String {
     out
 }
 
+/// One temperature read of each DIMM.
+fn ram_readings(buses: &[std::fs::File], dimms: &[Dimm]) -> Vec<Reading> {
+    dimms
+        .iter()
+        .map(|d| {
+            let dev = &buses[d.bus];
+            let off = smb_read(dev, d.addr, MR_TEMP_CONFIG).is_some_and(|c| c & 1 != 0);
+            let temp = match (smb_read(dev, d.addr, MR_TEMP), smb_read(dev, d.addr, MR_TEMP + 1)) {
+                (Some(lo), Some(hi)) if !off => Some(spd5118_temp(lo, hi)).filter(|t| *t > -40.0 && *t < 150.0),
+                _ => None,
+            };
+            Reading {
+                // Same label scheme as Linux: "spd5118 (0-0050)".
+                id: format!("smb{}:{:02x}", d.bus, d.addr),
+                label: format!("spd5118 ({}-{:04x})", d.bus, d.addr),
+                device: d.model.clone(),
+                temp,
+                critical: d.critical,
+                cpu: false,
+                kind: "RAM",
+                note: off.then(|| "sensor off".into()),
+            }
+        })
+        .collect()
+}
+
 impl Source for RamSource {
     fn read(&mut self) -> Vec<Reading> {
-        if self.dimms.is_empty() {
-            return match self.note {
-                Some(note) => vec![Reading {
-                    id: "smb:ram".into(),
-                    label: "spd5118".into(),
-                    device: "RAM".into(),
-                    temp: None,
-                    critical: None,
-                    cpu: false,
-                    kind: "RAM",
-                    note: Some(note.into()),
-                }],
-                None => Vec::new(),
-            };
+        if let Some(w) = &self.worker {
+            return w.latest();
         }
-        self.dimms
-            .iter()
-            .map(|d| {
-                let dev = &self.buses[d.bus];
-                let off = smb_read(dev, d.addr, MR_TEMP_CONFIG).is_some_and(|c| c & 1 != 0);
-                let temp = match (smb_read(dev, d.addr, MR_TEMP), smb_read(dev, d.addr, MR_TEMP + 1)) {
-                    (Some(lo), Some(hi)) if !off => Some(spd5118_temp(lo, hi)).filter(|t| *t > -40.0 && *t < 150.0),
-                    _ => None,
-                };
-                Reading {
-                    // Same label scheme as Linux: "spd5118 (0-0050)".
-                    id: format!("smb{}:{:02x}", d.bus, d.addr),
-                    label: format!("spd5118 ({}-{:04x})", d.bus, d.addr),
-                    device: d.model.clone(),
-                    temp,
-                    critical: d.critical,
-                    cpu: false,
-                    kind: "RAM",
-                    note: off.then(|| "sensor off".into()),
-                }
-            })
-            .collect()
+        match self.note {
+            Some(note) => vec![Reading {
+                id: "smb:ram".into(),
+                label: "spd5118".into(),
+                device: "RAM".into(),
+                temp: None,
+                critical: None,
+                cpu: false,
+                kind: "RAM",
+                note: Some(note.into()),
+            }],
+            None => Vec::new(),
+        }
     }
     fn name(&self) -> &'static str {
         "smbus"
@@ -1149,9 +1270,12 @@ impl NvRegs {
         out
     }
 
-    /// Temperatures for the GPU on PCI bus `bus`, if its BAR0 is mapped.
-    pub fn read(&mut self, bus: u32) -> Option<crate::nvapi::Temps> {
-        let g = self.gpus.iter_mut().find(|g| g.sel.bus as u32 == bus)?;
+    /// Temperatures for the GPU at `bus_id` (nvidia-smi's "00000000:01:00.0"),
+    /// if its BAR0 is mapped. The whole address is compared: GPUs in
+    /// different PCI domains can have the same bus number.
+    pub fn read(&mut self, bus_id: &str) -> Option<crate::nvapi::Temps> {
+        let want = parse_bus_id(bus_id)?;
+        let g = self.gpus.iter_mut().find(|g| g.sel == want)?;
         let id = g.device_id;
         let mut t = crate::nvapi::Temps::default();
         let mut state = std::mem::take(&mut g.state);
@@ -1159,6 +1283,21 @@ impl NvRegs {
         g.state = state;
         Some(t)
     }
+}
+
+/// nvidia-smi's "00000000:01:00.0" (domain:bus:device.function, in hex)
+/// as a pcisel.
+fn parse_bus_id(id: &str) -> Option<PciSel> {
+    let (domain, rest) = id.trim().split_once(':')?;
+    let (bus, rest) = rest.split_once(':')?;
+    let (dev, func) = rest.split_once('.')?;
+    let hex = |s: &str| u32::from_str_radix(s, 16).ok();
+    Some(PciSel {
+        domain: hex(domain)?,
+        bus: u8::try_from(hex(bus)?).ok()?,
+        dev: u8::try_from(hex(dev)?).ok()?,
+        func: u8::try_from(hex(func)?).ok()?,
+    })
 }
 
 /// NVIDIA display controllers (vgapci) and their PCI device ids.
@@ -1283,6 +1422,30 @@ mod tests {
     }
 
     #[test]
+    fn geom_text_unescaped() {
+        assert_eq!(xml_unescape("Smith &amp; Co &lt;SSD&gt; &quot;A&quot; &apos;B&apos;"), "Smith & Co <SSD> \"A\" 'B'");
+        assert_eq!(xml_unescape("A&#38;B &#x26; &#X3C;"), "A&B & <");
+        // Not an entity: kept as written.
+        assert_eq!(xml_unescape("R&D & more; &bogus; &#xZZ; &"), "R&D & more; &bogus; &#xZZ; &");
+        let xml = "<class id=\"0x4\"><name>DISK</name><geom><provider id=\"0x6\"><name>da0</name>\
+                   <mediasize>64000000000</mediasize><config><descr>SanDisk &amp; Co</descr></config></provider></geom></class>";
+        assert_eq!(parse_geom_disks(xml)[0].model.as_deref(), Some("SanDisk & Co"));
+    }
+
+    #[test]
+    fn nvme_attach_lines() {
+        let boot = "nda0 at nvme1 bus 0 scbus9 target 0 lun 1\nnda0: <Samsung SSD 990 PRO 4TB>\n\
+                    nda1 at nvme0 bus 0 scbus8 target 0 lun 1\n";
+        assert_eq!(attach_parent(boot, "nda0").as_deref(), Some("nvme1"));
+        assert_eq!(attach_parent(boot, "nda1").as_deref(), Some("nvme0"));
+        assert_eq!(attach_parent(boot, "nda2"), None);
+        // Message buffer: priorities in front, and the latest attach wins.
+        let msgbuf = "<6>nda2 at nvme3 bus 0 scbus4 target 0 lun 1\n<6>nda2 at nvme4 bus 0 scbus5 target 0 lun 1\n";
+        assert_eq!(attach_parent(msgbuf, "nda2").as_deref(), Some("nvme4"));
+        assert_eq!(attach_parent("ada0 at ahcich0 bus 0 scbus0", "ada0"), None);
+    }
+
+    #[test]
     fn link_speed() {
         assert_eq!(media_mbps("\tmedia: Ethernet autoselect (1000baseT <full-duplex>)\n"), Some(1000));
         assert_eq!(media_mbps("\tmedia: Ethernet autoselect (2500Base-T <full-duplex>)\n"), Some(2500));
@@ -1328,6 +1491,11 @@ mod tests {
         .unwrap();
         assert_eq!((sel, id), (PciSel { domain: 0, bus: 1, dev: 0, func: 0 }, 0x2c02));
         assert!(parse_vgapci("vendor=0x1002 device=0x744c", "dbsf=pci0:3:0:0").is_none());
+        // nvidia-smi's address for it, and one on bus 1 of PCI domain 1.
+        assert_eq!(parse_bus_id("00000000:01:00.0"), Some(sel));
+        assert_eq!(parse_bus_id("00000001:01:00.0"), Some(PciSel { domain: 1, bus: 1, dev: 0, func: 0 }));
+        assert_eq!(parse_bus_id("0000:c1:1f.7"), Some(PciSel { domain: 0, bus: 0xc1, dev: 0x1f, func: 7 }));
+        assert_eq!(parse_bus_id("N/A"), None);
     }
 
     /// The register decoding over a BAR0 stand-in (anonymous memory holding

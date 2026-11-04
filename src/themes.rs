@@ -367,17 +367,144 @@ fn config_dir() -> Option<std::path::PathBuf> {
         .or_else(|| std::env::var_os("APPDATA").map(std::path::PathBuf::from))?;
     let dir = base.join("oryn");
     let old = base.join("tempmon");
-    if !dir.exists() && old.is_dir()
-        && std::fs::create_dir_all(&dir).is_ok() {
+    if !dir.exists() && old.is_dir() {
+        // As root in the user's own folders: never through their symlinks.
+        #[cfg(unix)]
+        if let Some((uid, gid, _)) = sudo_user() {
+            let _ = migrate_as_user(&old, &dir, uid, gid);
+            return Some(dir);
+        }
+        if std::fs::create_dir_all(&dir).is_ok() {
             for e in std::fs::read_dir(&old).into_iter().flatten().flatten() {
                 if e.path().is_file() {
                     let _ = std::fs::copy(e.path(), dir.join(e.file_name()));
-                    give_back(&dir.join(e.file_name()));
                 }
             }
-            give_back(&dir);
         }
+    }
     Some(dir)
+}
+
+/// Under sudo, copy the old `tempmon` settings into `dir` for the user
+/// (`uid`, `gid`): only regular files of theirs, each opened without
+/// following a symlink, from a folder of theirs that isn't a symlink
+/// either, so root never copies a file the user can't read themselves.
+#[cfg(unix)]
+fn migrate_as_user(old: &std::path::Path, dir: &std::path::Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let m = std::fs::symlink_metadata(old)?;
+    if !m.is_dir() || m.uid() != uid {
+        return Err(not_theirs(old));
+    }
+    make_dir_as_user(dir, uid, gid)?;
+    for e in std::fs::read_dir(old)?.flatten() {
+        let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
+        let Ok(mut f) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(e.path()) else {
+            continue;
+        };
+        if !f.metadata().is_ok_and(|m| m.is_file() && m.uid() == uid) {
+            continue;
+        }
+        let mut data = Vec::new();
+        if f.read_to_end(&mut data).is_ok() {
+            let _ = write_as_user(dir, &name, &data, uid, gid);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn not_theirs(path: &std::path::Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("{}: a symlink or not the user's own", path.display()),
+    )
+}
+
+/// Under sudo, make sure the settings folder `dir` exists as a real folder
+/// (not a symlink) owned by the user (`uid`, `gid`), creating it (and
+/// `~/.config` if missing) for them. Refuses a symlinked or foreign `dir`,
+/// and a `~/.config` that resolves to someone else's folder.
+#[cfg(unix)]
+fn make_dir_as_user(dir: &std::path::Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::{lchown, MetadataExt};
+    let fresh = std::fs::symlink_metadata(dir).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+    if fresh && let Some(parent) = dir.parent() {
+        match std::fs::symlink_metadata(parent) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(parent)?;
+                lchown(parent, Some(uid), Some(gid))?;
+            }
+            Err(e) => return Err(e),
+            // A root-owned ~/.config (left by an earlier sudo run): theirs again.
+            Ok(m) if m.is_dir() && m.uid() == 0 => lchown(parent, Some(uid), Some(gid))?,
+            // Anything else (a symlink to a dotfiles folder too) must lead to theirs.
+            Ok(_) => {
+                if std::fs::metadata(parent)?.uid() != uid {
+                    return Err(not_theirs(parent));
+                }
+            }
+        }
+    }
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(dir)?;
+            lchown(dir, Some(uid), Some(gid))
+        }
+        Err(e) => Err(e),
+        Ok(m) if m.is_dir() && m.uid() == uid => Ok(()),
+        Ok(_) => Err(not_theirs(dir)),
+    }
+}
+
+/// Under sudo, write `contents` to `dir/name` for the user (`uid`, `gid`)
+/// without following any symlink they may have planted: `dir` is opened as
+/// a folder without following a link and must be theirs; the data goes to
+/// a new temp file in it (created relative to that open folder, never
+/// through a link), which is handed to them by its descriptor and then
+/// renamed over `name` (replacing a link there, not its target).
+#[cfg(unix)]
+fn write_as_user(dir: &std::path::Path, name: &str, contents: &[u8], uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let d = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)?;
+    let m = d.metadata()?;
+    if !m.is_dir() || m.uid() != uid {
+        return Err(not_theirs(dir));
+    }
+    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad settings file name");
+    if name.is_empty() || name.contains('/') || name.starts_with('.') {
+        return Err(bad());
+    }
+    let tmp = std::ffi::CString::new(format!(".{name}.{}.tmp", std::process::id())).map_err(|_| bad())?;
+    let dst = std::ffi::CString::new(name).map_err(|_| bad())?;
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: a valid directory descriptor and NUL-terminated name.
+    let fd = unsafe { libc::openat(d.as_raw_fd(), tmp.as_ptr(), flags, 0o666 as libc::c_uint) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just opened and is owned by nothing else.
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let r = f.write_all(contents).and_then(|()| std::os::unix::fs::fchown(&f, Some(uid), Some(gid))).and_then(|()| {
+        // SAFETY: the same descriptor and NUL-terminated names.
+        if unsafe { libc::renameat(d.as_raw_fd(), tmp.as_ptr(), d.as_raw_fd(), dst.as_ptr()) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    });
+    if r.is_err() {
+        // Our own temp file (O_EXCL: nothing else was there).
+        // SAFETY: as above.
+        unsafe { libc::unlinkat(d.as_raw_fd(), tmp.as_ptr(), 0) };
+    }
+    r
 }
 
 /// The user who ran `sudo oryn`: (uid, gid, home). None when not under sudo.
@@ -413,7 +540,8 @@ fn sudo_user() -> Option<(u32, u32, std::path::PathBuf)> {
 pub(crate) fn give_back(path: &std::path::Path) {
     #[cfg(unix)]
     if let Some((uid, gid, _)) = sudo_user() {
-        let _ = std::os::unix::fs::chown(path, Some(uid), Some(gid));
+        // lchown: a symlink put in its place is never followed.
+        let _ = std::os::unix::fs::lchown(path, Some(uid), Some(gid));
     }
     #[cfg(not(unix))]
     let _ = path;
@@ -427,33 +555,14 @@ pub fn write_config(name: &str, contents: &str) {
         return;
     }
     let Some(dir) = config_dir() else { return };
-    let fresh = !dir.exists();
-    if std::fs::create_dir_all(&dir).is_err() {
+    // As root in the user's own folder: never through their symlinks.
+    #[cfg(unix)]
+    if let Some((uid, gid, _)) = sudo_user() {
+        let _ = make_dir_as_user(&dir, uid, gid).and_then(|()| write_as_user(&dir, name, contents.as_bytes(), uid, gid));
         return;
     }
-    if fresh {
-        give_back(&dir);
-        if let Some(parent) = dir.parent() {
-            // ~/.config itself, if we just created it.
-            if std::fs::metadata(parent).is_ok_and(|m| {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    m.uid() == 0
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = m;
-                    false
-                }
-            }) {
-                give_back(parent);
-            }
-        }
-    }
-    let path = dir.join(name);
-    if std::fs::write(&path, contents).is_ok() {
-        give_back(&path);
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(dir.join(name), contents);
     }
 }
 
@@ -525,6 +634,88 @@ mod tests {
         // Readable colors are left untouched.
         let d = THEMES[find("dracula").unwrap()];
         assert_eq!(d.legible().warn, d.warn);
+    }
+
+    /// A fresh folder under target/ for one test (and the ids of whoever
+    /// runs the tests, standing in for the sudo user).
+    #[cfg(unix)]
+    fn scratch(what: &str) -> (std::path::PathBuf, u32, u32) {
+        let d = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("target/oryn-test-{what}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // SAFETY: getuid/getgid have no preconditions.
+        (d, unsafe { libc::getuid() }, unsafe { libc::getgid() })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_writes_replace_planted_symlinks_never_follow_them() {
+        use std::os::unix::fs::symlink;
+        let (t, uid, gid) = scratch("cfg-link");
+        let victim = t.join("victim");
+        std::fs::write(&victim, "precious\n").unwrap();
+        let dir = t.join("oryn");
+        make_dir_as_user(&dir, uid, gid).unwrap();
+        // theme -> ../victim: the link itself is replaced, the target untouched.
+        symlink(&victim, dir.join("theme")).unwrap();
+        write_as_user(&dir, "theme", b"dracula\n", uid, gid).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious\n");
+        assert!(std::fs::symlink_metadata(dir.join("theme")).unwrap().is_file());
+        assert_eq!(std::fs::read_to_string(dir.join("theme")).unwrap(), "dracula\n");
+        // A link waiting at the temp file's name: refused, nothing written.
+        symlink(&victim, dir.join(format!(".panels.{}.tmp", std::process::id()))).unwrap();
+        assert!(write_as_user(&dir, "panels", b"x\n", uid, gid).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious\n");
+        assert!(!dir.join("panels").exists());
+        // Odd names never leave the folder.
+        assert!(write_as_user(&dir, "../escape", b"x", uid, gid).is_err());
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_writes_refuse_a_symlinked_or_foreign_folder() {
+        let (t, uid, gid) = scratch("cfg-dir");
+        let real = t.join("elsewhere");
+        std::fs::create_dir(&real).unwrap();
+        // ~/.config/oryn -> elsewhere: refused, nothing created there.
+        let dir = t.join("oryn");
+        std::os::unix::fs::symlink(&real, &dir).unwrap();
+        assert!(make_dir_as_user(&dir, uid, gid).is_err());
+        assert!(write_as_user(&dir, "theme", b"x", uid, gid).is_err());
+        assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+        // A real folder of somebody else's.
+        assert!(make_dir_as_user(&real, uid + 1, gid).is_err());
+        assert!(write_as_user(&real, "theme", b"x", uid + 1, gid).is_err());
+        assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+        // Missing: created (with its missing parent), then written.
+        let fresh = t.join("home/.config/oryn");
+        make_dir_as_user(&fresh, uid, gid).unwrap();
+        write_as_user(&fresh, "theme", b"nord\n", uid, gid).unwrap();
+        assert_eq!(std::fs::read_to_string(fresh.join("theme")).unwrap(), "nord\n");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_migration_copies_only_real_files() {
+        let (t, uid, gid) = scratch("cfg-migrate");
+        let old = t.join("tempmon");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("theme"), "nord\n").unwrap();
+        std::fs::write(t.join("secret"), "root only\n").unwrap();
+        std::os::unix::fs::symlink(t.join("secret"), old.join("panels")).unwrap();
+        let dir = t.join("oryn");
+        migrate_as_user(&old, &dir, uid, gid).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("theme")).unwrap(), "nord\n");
+        assert!(!dir.join("panels").exists(), "a symlink's target is never copied");
+        // A symlinked old folder is not read at all.
+        let (t2, ..) = scratch("cfg-migrate2");
+        std::os::unix::fs::symlink(&old, t2.join("tempmon")).unwrap();
+        assert!(migrate_as_user(&t2.join("tempmon"), &t2.join("oryn"), uid, gid).is_err());
+        assert!(!t2.join("oryn").exists());
+        let _ = std::fs::remove_dir_all(&t);
+        let _ = std::fs::remove_dir_all(&t2);
     }
 
     #[test]

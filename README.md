@@ -33,8 +33,17 @@ you can show, hide and rearrange.
   integrated GPUs, which have no sensor of their own, the CPU package
   temperature).
 - **Drives:** SATA through the `drivetemp` driver, everything else through
-  SMART. Sleeping hard drives are never woken up just to read them.
+  SMART. Sleeping hard drives are never woken up just to read them (SMART
+  queries use `-n standby`; on Linux, see the `drivetemp` caveat under
+  [Hard drive temperatures](#hard-drive-hddssd-temperatures)).
 - **Processes:** btop-like list with search, start, terminate, kill and nice.
+- **Line graphs:** the CPU, GPU, network and temperature histories are drawn
+  as box-drawing lines on a faint grid, one sample per column with the newest
+  on the right (up to 600 samples, so wide terminals fill the whole graph);
+  the CPU and GPU panels ask for 4 graph rows; a graph squeezed under 4 rows
+  (a very short window) uses braille dots instead. Download and upload
+  share one graph as two lines from 0 up (no longer mirrored above/below a
+  middle axis).
 - **Compact mode** (`c`): only the temperatures, in a dense multi-column list.
 - **100 color schemes**, mouse support, °C/°F, adjustable refresh rate.
   Your theme, panels and layout are remembered.
@@ -47,8 +56,8 @@ you can show, hide and rearrange.
   code for macOS and Windows too, but it hasn't been built or tested there yet.
 - **On FreeBSD:** CPU temperatures need `kldload amdtemp` (AMD) or
   `kldload coretemp` (Intel); add it to `kld_list` in `/etc/rc.conf` to make
-  it permanent. Drive temperatures need `smartmontools` and root (or a
-  sudoers rule for `/usr/local/sbin/smartctl`). NVIDIA GPUs work with the
+  it permanent. Drive temperatures need `smartmontools` and root (or the
+  narrow sudoers rule under [FreeBSD](#freebsd)). NVIDIA GPUs work with the
   `nvidia-driver` package; their hotspot and VRAM temperatures (RTX 30
   GDDR6X and newer) are read from the GPU's registers through a read-only
   mapping of BAR0, which needs root (`--no-nvapi` turns it off). Build
@@ -76,7 +85,8 @@ you can show, hide and rearrange.
 
 **To build from source**
 
-- Rust **1.85 or newer** with Cargo. The `cargo` packages of Arch and recent
+- Rust **1.95 or newer** with Cargo (`rust-version` in Cargo.toml; the
+  `sysinfo` crate needs it). The `cargo` packages of Arch and current
   Fedora are new enough. On Debian and Ubuntu they are usually too old, so
   install Rust with [rustup](https://rustup.rs).
 - A C linker (`gcc` or `clang`): `base-devel` on Arch, `build-essential` on
@@ -86,17 +96,17 @@ you can show, hide and rearrange.
 
 The [releases](https://github.com/rusty725/oryn/releases) have
 ready-made packages for x86_64 (64-bit Intel/AMD): the Linux and FreeBSD
-ones below are from [v0.1.12](https://github.com/rusty725/oryn/releases/tag/v0.1.12).
+ones below are from [v0.1.13](https://github.com/rusty725/oryn/releases/tag/v0.1.13).
 On other machines (aarch64…), [build from source](#any-linux-distribution-from-source).
 
 | Package | For |
 |---------|-----|
-| `oryn-0.1.12-1-x86_64.pkg.tar.zst` | Arch Linux, CachyOS, EndeavourOS, Manjaro |
-| `oryn_0.1.12-1_amd64.deb` | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS |
-| `oryn-0.1.12-1.x86_64.rpm` | Fedora, RHEL / Rocky / Alma 9+, openSUSE |
-| `oryn-0.1.12-x86_64-linux.tar.gz` | any other x86_64 Linux with glibc 2.34+ |
-| `oryn-0.1.12-freebsd-amd64.pkg` | FreeBSD 15 (amd64), installed with `pkg` |
-| `oryn-0.1.12-amd64-freebsd.tar.gz` | FreeBSD 15 (amd64): binary, man page and instructions |
+| `oryn-0.1.13-1-x86_64.pkg.tar.zst` | Arch Linux, CachyOS, EndeavourOS, Manjaro |
+| `oryn_0.1.13-1_amd64.deb` | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS |
+| `oryn-0.1.13-1.x86_64.rpm` | Fedora, RHEL / Rocky / Alma 9+, openSUSE |
+| `oryn-0.1.13-x86_64-linux.tar.gz` | any other x86_64 Linux with glibc 2.34+ |
+| `oryn-0.1.13-freebsd-amd64.pkg` | FreeBSD 15 (amd64), installed with `pkg` |
+| `oryn-0.1.13-amd64-freebsd.tar.gz` | FreeBSD 15 (amd64): binary, man page and instructions |
 
 Each package installs the `oryn` command and its man page (`man oryn`).
 The commands below download the file into the current folder and install
@@ -106,8 +116,8 @@ run `sha256sum -c --ignore-missing SHA256SUMS`.
 ### Arch Linux, CachyOS, Manjaro
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.12/oryn-0.1.12-1-x86_64.pkg.tar.zst
-sudo pacman -U oryn-0.1.12-1-x86_64.pkg.tar.zst
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.13/oryn-0.1.13-1-x86_64.pkg.tar.zst
+sudo pacman -U oryn-0.1.13-1-x86_64.pkg.tar.zst
 sudo pacman -S --needed --asdeps smartmontools hwdata   # optional extras
 ```
 
@@ -123,8 +133,8 @@ makepkg -si
 ### Debian, Ubuntu, Linux Mint, Pop!_OS
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.12/oryn_0.1.12-1_amd64.deb
-sudo apt install ./oryn_0.1.12-1_amd64.deb
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.13/oryn_0.1.13-1_amd64.deb
+sudo apt install ./oryn_0.1.13-1_amd64.deb
 sudo apt install smartmontools          # optional extra
 ```
 
@@ -134,8 +144,8 @@ in its repositories instead of the file.
 ### Fedora, RHEL, Rocky, AlmaLinux
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.12/oryn-0.1.12-1.x86_64.rpm
-sudo dnf install ./oryn-0.1.12-1.x86_64.rpm
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.13/oryn-0.1.13-1.x86_64.rpm
+sudo dnf install ./oryn-0.1.13-1.x86_64.rpm
 ```
 
 `dnf` also installs the recommended `smartmontools` and `hwdata`.
@@ -143,8 +153,8 @@ sudo dnf install ./oryn-0.1.12-1.x86_64.rpm
 ### openSUSE
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.12/oryn-0.1.12-1.x86_64.rpm
-sudo zypper install --allow-unsigned-rpm ./oryn-0.1.12-1.x86_64.rpm
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.13/oryn-0.1.13-1.x86_64.rpm
+sudo zypper install --allow-unsigned-rpm ./oryn-0.1.13-1.x86_64.rpm
 ```
 
 ### Any other Linux: the .tar.gz
@@ -153,9 +163,9 @@ A plain binary plus the man page, for distributions without a package
 above. Needs glibc 2.34 or newer (`ldd --version` shows yours).
 
 ```sh
-curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.12/oryn-0.1.12-x86_64-linux.tar.gz
-tar xzf oryn-0.1.12-x86_64-linux.tar.gz
-cd oryn-0.1.12-x86_64-linux
+curl -LO https://github.com/rusty725/oryn/releases/download/v0.1.13/oryn-0.1.13-x86_64-linux.tar.gz
+tar xzf oryn-0.1.13-x86_64-linux.tar.gz
+cd oryn-0.1.13-x86_64-linux
 sudo install -Dm755 oryn /usr/local/bin/oryn
 sudo install -Dm644 oryn.1 /usr/local/share/man/man1/oryn.1
 ```
@@ -180,16 +190,16 @@ cargo install --locked --git https://github.com/rusty725/oryn
 Built on FreeBSD 15.1-RELEASE (amd64). With the package:
 
 ```sh
-fetch https://github.com/rusty725/oryn/releases/download/v0.1.12/oryn-0.1.12-freebsd-amd64.pkg
-sudo pkg add ./oryn-0.1.12-freebsd-amd64.pkg
+fetch https://github.com/rusty725/oryn/releases/download/v0.1.13/oryn-0.1.13-freebsd-amd64.pkg
+sudo pkg add ./oryn-0.1.13-freebsd-amd64.pkg
 ```
 
 Or with the .tar.gz:
 
 ```sh
-fetch https://github.com/rusty725/oryn/releases/download/v0.1.12/oryn-0.1.12-amd64-freebsd.tar.gz
-tar xzf oryn-0.1.12-amd64-freebsd.tar.gz
-cd oryn-0.1.12-amd64-freebsd
+fetch https://github.com/rusty725/oryn/releases/download/v0.1.13/oryn-0.1.13-amd64-freebsd.tar.gz
+tar xzf oryn-0.1.13-amd64-freebsd.tar.gz
+cd oryn-0.1.13-amd64-freebsd
 sudo install -m 755 oryn /usr/local/bin/oryn
 sudo install -m 644 oryn.1 /usr/local/share/man/man1/oryn.1
 ```
@@ -235,13 +245,32 @@ sudo oryn
 ```
 
 To let a normal `oryn` use `smartctl` and `dmidecode` without a password
-(Oryn only ever runs them as `sudo -n`, so it never prompts):
+(Oryn only ever runs them as `sudo -n`, so it never prompts). The rule
+allows exactly the commands Oryn runs and nothing else, because both
+programs can do far more as root (`smartctl` can change drive settings,
+`dmidecode --dump-bin` overwrites files):
 
 ```sh
-echo "$USER ALL=(root) NOPASSWD: /usr/local/sbin/smartctl, /usr/local/sbin/dmidecode" \
-  | sudo tee /usr/local/etc/sudoers.d/oryn
+SMART="/usr/local/sbin/smartctl -j -n standby -i -A"
+printf '%s\n' \
+  "$USER ALL=(root) NOPASSWD: $SMART -d nvme /dev/nvme[0-9], $SMART -d nvme /dev/nvme[1-9][0-9]" \
+  "$USER ALL=(root) NOPASSWD: $SMART -d atacam /dev/ada[0-9], $SMART -d atacam /dev/ada[1-9][0-9]" \
+  "$USER ALL=(root) NOPASSWD: $SMART /dev/da[0-9], $SMART /dev/da[1-9][0-9]" \
+  "$USER ALL=(root) NOPASSWD: $SMART -d sat /dev/da[0-9], $SMART -d sat /dev/da[1-9][0-9]" \
+  "$USER ALL=(root) NOPASSWD: /usr/local/sbin/dmidecode -t 17" \
+  | sudo tee /usr/local/etc/sudoers.d/oryn >/dev/null
 sudo chmod 440 /usr/local/etc/sudoers.d/oryn
+sudo visudo -cf /usr/local/etc/sudoers.d/oryn   # checks the syntax
 ```
+
+That is a read-only SMART query (`-j -n standby -i -A`, never waking a
+sleeping drive) of an NVMe controller, a SATA disk (`ada`) or a USB/SAS disk
+(`da`, plain or as SAT), and `dmidecode -t 17` (the memory table). The
+device names use `[0-9]` rather than `*`: in sudoers, `*` in the arguments
+also matches spaces, so `/dev/ada*` would allow any extra arguments after
+the device. A disk the rule doesn't cover just shows `needs root`. Each
+`sudo` run is a line in `/var/log/auth.log`, so Oryn reads these disks every
+5 minutes, and stops asking for the rest of the run if `sudo` refuses.
 
 ## Uninstall
 
@@ -290,15 +319,30 @@ Your theme and layout are the same with or without `sudo`. If Cargo
 installed Oryn to `~/.cargo/bin`, use `sudo ~/.cargo/bin/oryn`, because sudo
 doesn't search your own PATH.
 
-**Or allow just `smartctl` without a password.** When it isn't root, Oryn
-tries `sudo -n smartctl` on its own (it never asks for a password), so with
-this rule SMART temperatures work from a normal `oryn`:
+**Or allow just Oryn's `smartctl` query without a password.** When it isn't
+root, Oryn tries `sudo -n smartctl` on its own (it never asks for a
+password), so with this rule SMART temperatures work from a normal `oryn`:
 
 ```sh
-SMARTCTL=$(sudo sh -c 'command -v smartctl')   # /usr/bin or /usr/sbin, depending on the distro
-echo "$USER ALL=(root) NOPASSWD: $SMARTCTL" | sudo tee /etc/sudoers.d/oryn-smartctl
+SMART="$(sudo sh -c 'command -v smartctl') -j -n standby -i -A"   # /usr/bin or /usr/sbin, depending on the distro
+printf '%s\n' \
+  "$USER ALL=(root) NOPASSWD: $SMART /dev/sd[a-z], $SMART /dev/sd[a-z][a-z]" \
+  "$USER ALL=(root) NOPASSWD: $SMART -d sat /dev/sd[a-z], $SMART -d sat /dev/sd[a-z][a-z]" \
+  "$USER ALL=(root) NOPASSWD: $SMART -d scsi /dev/sd[a-z], $SMART -d scsi /dev/sd[a-z][a-z]" \
+  | sudo tee /etc/sudoers.d/oryn-smartctl >/dev/null
 sudo chmod 440 /etc/sudoers.d/oryn-smartctl
+sudo visudo -cf /etc/sudoers.d/oryn-smartctl   # checks the syntax
 ```
+
+The rule allows only the read-only query Oryn runs (`smartctl -j -n standby
+-i -A`, with the device type `smartctl --scan` reports, auto-detection, or
+SAT) on `/dev/sdX` disks, not `smartctl` with any arguments: as root it can
+also change drive settings. The device names use `[a-z]` rather than `*`,
+because in sudoers `*` in the arguments also matches spaces and would allow
+extra arguments. NVMe drives need no rule on Linux (the `nvme` driver
+reports them). Each `sudo` run is a line in the auth log, so Oryn reads
+these disks every 5 minutes, and stops asking for the rest of the run if
+`sudo` refuses.
 
 **Check what was found** at any time:
 
@@ -600,12 +644,19 @@ Disks are read from two places, without duplicates:
 1. **`drivetemp` kernel driver** (Linux, SATA): fast, read every refresh, no
    root needed. Enable it with `sudo modprobe drivetemp` (and add `drivetemp`
    to `/etc/modules-load.d/drivetemp.conf` to keep it after reboot). Rows look
-   like `drivetemp (sda)`.
+   like `drivetemp (sda)`. The driver itself avoids spinning up a sleeping
+   drive, but on some drives a temperature read still resets the drive's own
+   spin-down timer, so a disk that is meant to spin down may stay awake
+   while Oryn runs. If that matters, unload `drivetemp`: those disks then go
+   through SMART, which checks for standby first (`-n standby`).
 2. **SMART via `smartctl`** (package `smartmontools`) for every other disk,
    on Linux, Windows and macOS. Polled every 30 s in the background with
    `-n standby`, so **sleeping disks are never spun up**: they show `standby`
    with their last known temperature. SMART needs root/admin
-   (`sudo oryn`); otherwise rows show `needs root`.
+   (`sudo oryn`, or the sudoers rule under [After installing](#after-installing),
+   which reads those disks every 5 minutes); otherwise rows show `needs root`.
+   Each `smartctl` run is stopped after 10 s, and a disk that never reports
+   a temperature (virtual disks, RAID volumes) is retried every 10 minutes.
 
 NVMe drives come from the kernel's `nvme` driver on Linux. If a SATA disk shows
 `modprobe drivetemp`, neither source is available yet; either fix above works.

@@ -27,6 +27,28 @@ pub enum Sig {
     Kill,
 }
 
+/// The process running as `pid` right now: its name and start time
+/// (seconds since the epoch), like the process list shows them. None when
+/// there is none, or it has exited and waits to be reaped (a zombie).
+pub fn lookup(pid: u32) -> Option<(String, u64)> {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[pid]), true, sysinfo::ProcessRefreshKind::nothing());
+    let p = sys.process(pid)?;
+    (p.status() != sysinfo::ProcessStatus::Zombie).then(|| (p.name().to_string_lossy().to_string(), p.start_time()))
+}
+
+/// Is the process a prompt was opened for (`pid`, `name`, `start`) still
+/// the one running as `pid` (`now`, from [`lookup`])? A PID is reused once
+/// its process exits, so the name and start time must match too; otherwise
+/// the message for the status line.
+pub fn still_running(pid: u32, name: &str, start: u64, now: Option<(&str, u64)>) -> Result<(), String> {
+    match now {
+        Some((n, s)) if n == name && s == start => Ok(()),
+        _ => Err(format!("{name} (pid {pid}) has exited; nothing sent")),
+    }
+}
+
 /// Send `sig` to `pid`.
 pub fn signal(pid: u32, sig: Sig) -> Result<(), String> {
     if pid == std::process::id() {
@@ -98,10 +120,15 @@ pub fn alive(pid: u32) -> bool {
             Err(_) => false,
         }
     }
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(target_os = "freebsd")]
+    {
+        // kern.proc.pid.<pid> has the state; a zombie is SZOMB.
+        proc_stat(pid).is_some_and(|s| s != libc::SZOMB)
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
     {
         // Signal 0 only checks that the process exists; EPERM means it does,
-        // but belongs to another user.
+        // but belongs to another user. (A zombie still counts here.)
         // SAFETY: plain syscall with a pid and signal 0.
         let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
         r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
@@ -111,6 +138,32 @@ pub fn alive(pid: u32) -> bool {
         let _ = pid;
         true
     }
+}
+
+/// The process's run state (`ki_stat`: SRUN, SSLEEP, SZOMB…) from
+/// kern.proc.pid.<pid>, or None if there is no such process. Only two
+/// fields are taken from the raw struct, at libc's offsets; kinfo_proc
+/// keeps its layout across FreeBSD releases.
+#[cfg(target_os = "freebsd")]
+fn proc_stat(pid: u32) -> Option<libc::c_char> {
+    let mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid as libc::c_int];
+    let mut len: libc::size_t = 0;
+    // SAFETY: a size query (null buffer), then a read of at most `len` bytes into `buf`.
+    let r = unsafe {
+        if libc::sysctl(mib.as_ptr(), 4, std::ptr::null_mut(), &mut len, std::ptr::null(), 0) != 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len.max(std::mem::size_of::<libc::kinfo_proc>())];
+        len = buf.len();
+        let r = libc::sysctl(mib.as_ptr(), 4, buf.as_mut_ptr().cast(), &mut len, std::ptr::null(), 0);
+        buf.truncate(len);
+        (r == 0).then_some(buf)
+    };
+    let at_pid = std::mem::offset_of!(libc::kinfo_proc, ki_pid);
+    let at_stat = std::mem::offset_of!(libc::kinfo_proc, ki_stat);
+    let buf = r.filter(|b| b.len() > at_stat.max(at_pid + 4))?;
+    let got = i32::from_ne_bytes(buf[at_pid..at_pid + 4].try_into().ok()?);
+    (got == pid as i32).then_some(buf[at_stat] as libc::c_char)
 }
 
 /// Current nice value, or None if unknown.
@@ -208,7 +261,7 @@ mod tests {
     use super::*;
 
     fn p(pid: u32, name: &str, cmd: &str, user: &str) -> ProcInfo {
-        ProcInfo { pid, name: name.into(), cmd: cmd.into(), user: user.into(), mem: 0, cpu: 0.0, nice: None }
+        ProcInfo { pid, name: name.into(), cmd: cmd.into(), user: user.into(), mem: 0, cpu: 0.0, nice: None, start: 0 }
     }
 
     #[test]
@@ -220,6 +273,47 @@ mod tests {
         assert!(matches(&fx, "rusty"));
         assert!(matches(&fx, "9979"));
         assert!(!matches(&fx, "chrome"));
+    }
+
+    #[test]
+    fn recheck_before_signalling() {
+        let gone = "firefox (pid 4242) has exited; nothing sent";
+        assert_eq!(still_running(4242, "firefox", 1700000000, Some(("firefox", 1700000000))), Ok(()));
+        // Exited, or the PID now belongs to another process (other name, or
+        // the same name started later).
+        assert_eq!(still_running(4242, "firefox", 1700000000, None).unwrap_err(), gone);
+        assert_eq!(still_running(4242, "firefox", 1700000000, Some(("sshd", 1700000000))).unwrap_err(), gone);
+        assert_eq!(still_running(4242, "firefox", 1700000000, Some(("firefox", 1700000500))).unwrap_err(), gone);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn zombie_counts_as_gone() {
+        assert!(alive(std::process::id()));
+        let mut child = std::process::Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = child.id();
+        // Not reaped yet: it stays a zombie until wait().
+        let start = std::time::Instant::now();
+        while alive(pid) && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!alive(pid), "a zombie counted as running");
+        #[cfg(target_os = "freebsd")]
+        assert_eq!(proc_stat(pid), Some(libc::SZOMB));
+        child.wait().unwrap();
+        assert!(!alive(pid));
+    }
+
+    #[test]
+    fn lookup_matches_the_process_list() {
+        // Ourselves: the same name and start time sysinfo lists, stable
+        // between two lookups; a PID nothing runs as: None.
+        let me = std::process::id();
+        let (name, start) = lookup(me).unwrap();
+        assert!(!name.is_empty() && start > 0);
+        assert_eq!(lookup(me), Some((name.clone(), start)));
+        assert!(still_running(me, &name, start, lookup(me).as_ref().map(|(n, s)| (n.as_str(), *s))).is_ok());
+        assert_eq!(lookup(i32::MAX as u32 - 7), None);
     }
 
     #[test]

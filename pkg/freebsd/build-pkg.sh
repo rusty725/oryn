@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build oryn-<version>.pkg and oryn-<version>-amd64-freebsd.tar.gz for FreeBSD.
 # Run from the repository root:  sh pkg/freebsd/build-pkg.sh
-# Needs: cargo (pkg install rust, or rustup), pkg(8).
+# Needs: cargo (pkg install rust, or rustup), python3, pkg(8).
 set -eu
 
 PKG=oryn
@@ -16,12 +16,16 @@ cargo build --release --locked
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
+# License notices of the crates in this binary: worked out for the FreeBSD
+# target (the checked-in LICENSES-dependencies.txt is the Linux one).
+python3 pkg/gen-dep-licenses.py "$(rustc -vV | sed -n 's/^host: //p')" "$OUT/LICENSES-dependencies.txt"
+
 # Staged install tree under /usr/local, as ports do.
 install -d "$STAGE/usr/local/bin" "$STAGE/usr/local/share/man/man1" "$STAGE/usr/local/share/doc/$PKG"
 install -m 755 -s target/release/oryn "$STAGE/usr/local/bin/oryn"
 gzip -9nc doc/oryn.1 > "$STAGE/usr/local/share/man/man1/oryn.1.gz"
-for f in README.md LICENSE THIRD_PARTY_NOTICES.md LICENSES-dependencies.txt; do
-  install -m 644 "$f" "$STAGE/usr/local/share/doc/$PKG/$f"
+for f in README.md LICENSE THIRD_PARTY_NOTICES.md "$OUT/LICENSES-dependencies.txt"; do
+  install -m 644 "$f" "$STAGE/usr/local/share/doc/$PKG/$(basename "$f")"
 done
 
 (cd "$STAGE" && find usr -type f | sed 's|^|/|' | sort) > "$OUT/plist"
@@ -29,6 +33,9 @@ done
 # Shown by pkg after installing; also printed by `pkg info -D oryn`.
 MESSAGE=$(cat pkg/freebsd/pkg-message)
 
+# Licenses: oryn is MIT, the rest come from the crates compiled into it
+# (the same list as the Arch and rpm packages; all of them apply, hence
+# "multi").
 cat > "$OUT/+MANIFEST" <<MANIFEST
 name: $PKG
 version: "$VER"
@@ -39,8 +46,8 @@ www: https://github.com/rusty725/oryn
 abi: "$ABI"
 arch: "$(echo "$ABI" | tr '[:upper:]' '[:lower:]')"
 prefix: /usr/local
-licenselogic: single
-licenses: [MIT]
+licenselogic: multi
+licenses: [MIT, Apache-2.0, ISC, Zlib, Unicode-3.0, BSL-1.0, Unlicense]
 categories: [sysutils]
 desc: <<EOD
 Oryn shows every temperature sensor in the machine in one table: CPU
@@ -64,8 +71,8 @@ mkdir -p "$TARDIR"
 install -m 755 "$STAGE/usr/local/bin/oryn" "$TARDIR/oryn"
 install -m 644 doc/oryn.1 "$TARDIR/oryn.1"
 install -m 644 pkg/freebsd/pkg-message "$TARDIR/INSTALL-FreeBSD.txt"
-for f in README.md LICENSE THIRD_PARTY_NOTICES.md LICENSES-dependencies.txt; do
-  install -m 644 "$f" "$TARDIR/$f"
+for f in README.md LICENSE THIRD_PARTY_NOTICES.md "$OUT/LICENSES-dependencies.txt"; do
+  install -m 644 "$f" "$TARDIR/$(basename "$f")"
 done
 tar -czf "$TARDIR.tar.gz" -C "$OUT" "$(basename "$TARDIR")"
 echo "built $TARDIR.tar.gz"

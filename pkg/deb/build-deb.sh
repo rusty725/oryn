@@ -30,7 +30,7 @@ gzip -9n "$DOC/README.md" "$DOC/LICENSES-dependencies.txt"
   echo "Upstream-Contact: rusty725"
   echo "Source: https://github.com/rusty725/oryn"
   echo "Comment: The binary also contains Rust crates under MIT, Apache-2.0, ISC,"
-  echo " Zlib, BSL-1.0 and Unlicense licenses; their notices are in"
+  echo " Zlib, Unicode-3.0, BSL-1.0 and Unlicense licenses; their notices are in"
   echo " /usr/share/doc/oryn/LICENSES-dependencies.txt.gz."
   echo
   echo "Files: *"

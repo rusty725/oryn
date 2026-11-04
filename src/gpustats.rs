@@ -151,8 +151,7 @@ impl GpuStats {
         if !list.is_empty() && !crate::nvapi::disabled() {
             let regs = self.nv_regs.get_or_insert_with(crate::freebsd::NvRegs::open);
             for (key, g) in list.iter_mut() {
-                let Some(bus) = crate::nvapi::bus_number(key.trim_start_matches("nv:")) else { continue };
-                match regs.read(bus) {
+                match regs.read(key.trim_start_matches("nv:")) {
                     Some(t) => {
                         g.hotspot = t.hotspot;
                         g.hotspot_note = t.hotspot_note;
